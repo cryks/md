@@ -1,0 +1,14 @@
+[package]
+name = "md"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
+mermaid-text = "0.56"
+pulldown-cmark = "0.13"
+syntect = "5"
+unicode-width = "0.2"
