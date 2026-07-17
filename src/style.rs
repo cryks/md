@@ -250,6 +250,49 @@ pub(crate) fn line_with_search_highlight(line: &StyledLine, query: &str) -> Styl
 
     let plain = line.plain_text();
     let ranges = find_match_ranges(&plain, query);
+    line_with_style_overlay(line, &ranges, |_| TextStyle::search())
+}
+
+/// 全 span の背景を `bg` に置き換える。前景色と属性は保つ。
+pub(crate) fn line_with_bg(line: &StyledLine, bg: Color) -> StyledLine {
+    StyledLine {
+        spans: line
+            .spans
+            .iter()
+            .map(|span| {
+                StyledSpan::new(
+                    span.text.clone(),
+                    TextStyle {
+                        bg: Some(bg),
+                        ..span.style
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// plain text への byte range にある部分だけ背景を `bg` に置き換える。
+/// 前景色と属性は元の span を保つ。
+pub(crate) fn line_with_bg_ranges(
+    line: &StyledLine,
+    ranges: &[std::ops::Range<usize>],
+    bg: Color,
+) -> StyledLine {
+    line_with_style_overlay(line, ranges, |style| TextStyle {
+        bg: Some(bg),
+        ..style
+    })
+}
+
+/// plain text への byte range と重なる部分のスタイルを `overlay` の返り値へ
+/// 差し替える。range が span 内の char 境界に合わない場合、その span では
+/// 差し替えず元のスタイルを残す。
+fn line_with_style_overlay(
+    line: &StyledLine,
+    ranges: &[std::ops::Range<usize>],
+    overlay: impl Fn(TextStyle) -> TextStyle,
+) -> StyledLine {
     if ranges.is_empty() {
         return line.clone();
     }
@@ -276,7 +319,7 @@ pub(crate) fn line_with_search_highlight(line: &StyledLine, query: &str) -> Styl
                 output.push(&span.text[cursor..start], span.style);
             }
             if start < end {
-                output.push(&span.text[start..end], TextStyle::search());
+                output.push(&span.text[start..end], overlay(span.style));
             }
             cursor = end;
         }
@@ -320,5 +363,36 @@ mod tests {
         let line = StyledLine::plain("abcdef");
 
         assert_eq!(slice_line(&line, 2, 3).plain_text(), "cde");
+    }
+
+    #[test]
+    fn bg_overlay_keeps_fg_and_splits_spans() {
+        let line = StyledLine::styled("hello world", TextStyle::code());
+
+        let output = line_with_bg_ranges(&line, std::slice::from_ref(&(6..11)), Color::Red);
+
+        assert_eq!(output.plain_text(), "hello world");
+        assert_eq!(output.spans.len(), 2);
+        assert_eq!(output.spans[0].style.bg, None);
+        assert_eq!(output.spans[1].text, "world");
+        assert_eq!(output.spans[1].style.bg, Some(Color::Red));
+        assert_eq!(output.spans[1].style.fg, TextStyle::code().fg);
+    }
+
+    #[test]
+    fn line_bg_replaces_every_span_background() {
+        let mut line = StyledLine::styled("a", TextStyle::code());
+        line.push("b", TextStyle::heading());
+
+        let output = line_with_bg(&line, Color::Blue);
+
+        assert!(
+            output
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(Color::Blue))
+        );
+        assert_eq!(output.spans[1].style.fg, TextStyle::heading().fg);
+        assert!(output.spans[1].style.bold);
     }
 }

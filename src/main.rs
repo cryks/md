@@ -1,6 +1,7 @@
 //! CLI 引数を解釈し、最初の Markdown 読み込みを pager へ渡す。
 //! 端末状態と再読み込みのライフサイクルは `pager` が所有し、この層では扱わない。
 
+mod diff;
 mod inline;
 mod pager;
 mod renderer;

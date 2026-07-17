@@ -1,7 +1,11 @@
 //! alternate screen 上の表示状態、キー操作、ファイル再読み込みを管理する。
 //! watch 中に読み込みが失敗した場合は最後に描画できた内容を保持し、同じパスを
 //! 次のポーリング周期で読み直す。同じ内容を連続して読めた時点で表示へ反映し、
-//! 内容が変わり続ける場合は1秒後に最新候補を反映する。
+//! 内容が変わり続ける場合は1秒後に最新候補を反映する。`r` はこの周期と安定待ちを
+//! 使わず、その場で読んで反映する。
+//!
+//! diff の基準 (snapshot) と表示層の状態もここが所有する。行の対応付けと行内の
+//! 変更 range は `diff` モジュールが計算し、この層は色と描画だけを持つ。
 
 use std::{
     fs,
@@ -15,7 +19,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute, queue,
-    style::{Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    style::{Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{
         self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode,
@@ -23,9 +27,11 @@ use crossterm::{
 };
 
 use crate::{
+    diff::{self, DiffLayers, DiffRow, RowKind},
     renderer,
     style::{
-        StyledLine, TextStyle, char_width, display_width, line_with_search_highlight, slice_line,
+        StyledLine, TextStyle, char_width, display_width, line_with_bg, line_with_bg_ranges,
+        line_with_search_highlight, slice_line,
     },
 };
 
@@ -119,6 +125,63 @@ enum Mode {
     SearchInput(String),
 }
 
+/// diff 表示の状態。New は現在の内容、Old は snapshot の内容を、どちらも
+/// 変更箇所ハイライトつきの整列済み行で描画する。`d` が New⇄Old を反転し、
+/// 共通行が同じ画面位置に来るため連打すると変更箇所だけが入れ替わって見える。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffView {
+    Off,
+    New,
+    Old,
+}
+
+/// diff 層の背景色。`line_bg` は変更行全体へうっすら、`emphasis_bg` は行内の
+/// 変更 range だけ濃く敷く。`filler_bg` は相手層にだけ行がある位置の空行で、
+/// 相手層側の色相を暗くしたもの (新層では削除位置 = 赤系、旧層では追加位置 =
+/// 緑系) にして、そこで行が増減したことを示す。
+struct DiffPalette {
+    line_bg: Color,
+    emphasis_bg: Color,
+    filler_bg: Color,
+}
+
+impl DiffPalette {
+    const NEW: Self = Self {
+        line_bg: Color::Rgb {
+            r: 18,
+            g: 52,
+            b: 26,
+        },
+        emphasis_bg: Color::Rgb {
+            r: 34,
+            g: 98,
+            b: 48,
+        },
+        filler_bg: Color::Rgb {
+            r: 44,
+            g: 22,
+            b: 22,
+        },
+    };
+    const OLD: Self = Self {
+        line_bg: Color::Rgb {
+            r: 62,
+            g: 26,
+            b: 26,
+        },
+        emphasis_bg: Color::Rgb {
+            r: 116,
+            g: 44,
+            b: 44,
+        },
+        filler_bg: Color::Rgb {
+            r: 22,
+            g: 42,
+            b: 26,
+        },
+    };
+}
+
 struct PendingSource {
     /// 確定前に読めた最新の内容。連続更新中はポーリングごとに置き換える。
     source: String,
@@ -140,15 +203,27 @@ struct App {
     mode: Mode,
     /// `true` の間だけ `path` を周期的に読み直す。通常モードの `w` で反転する。
     watch: bool,
-    /// watch 中の直近の読み込み失敗。成功時または watch の無効化時に `None` へ戻る。
-    watch_error: Option<String>,
+    /// 直近の読み込み失敗 (watch の周期読み込みと `r` の双方)。読み込み成功か
+    /// watch の切り替えで None へ戻る。
+    read_error: Option<String>,
     /// 安定待ち中の内容と開始時刻。確定、読み込み失敗、watch 無効化で破棄する。
     pending_source: Option<PendingSource>,
+    /// diff の基準となる Markdown 原文。`s` で取得と破棄が反転する。watch の
+    /// 有効化は基準が無いときだけ現在の内容を自動で入れ、手動の基準を上書きしない。
+    snapshot: Option<String>,
+    /// 表示中の層。Off 以外になるのは snapshot がある間だけで、破棄時は Off へ戻す。
+    diff_view: DiffView,
+    /// snapshot と現在の整列結果。source・snapshot・幅のいずれかが変わると None
+    /// へ戻り、次に diff 表示が必要になった時点で作り直す。
+    diff: Option<DiffLayers>,
+    /// 次のキー入力まで表示する操作ヒント。snapshot 無しで `d` を押した場合に出す。
+    hint: Option<String>,
 }
 
 impl App {
     fn new(path: PathBuf, source: String, width: u16, height: u16, watch: bool) -> Self {
         let lines = renderer::render_markdown(&source, width as usize);
+        let snapshot = watch.then(|| source.clone());
         Self {
             path,
             source,
@@ -162,21 +237,25 @@ impl App {
             match_index: None,
             mode: Mode::Normal,
             watch,
-            watch_error: None,
+            read_error: None,
             pending_source: None,
+            snapshot,
+            diff_view: DiffView::Off,
+            diff: None,
+            hint: None,
         }
     }
 
     fn resize(&mut self, width: u16, height: u16) {
         self.width = width;
         self.height = height;
-        self.lines = renderer::render_markdown(&self.source, width as usize);
-        self.rebuild_matches();
-        self.clamp_top();
-        self.clamp_left();
+        self.refresh_render();
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // ヒントは1キー分だけ見せる。どのキーでも次の入力で消える。
+        self.hint = None;
+
         match &mut self.mode {
             Mode::SearchInput(input) => match key.code {
                 KeyCode::Esc => {
@@ -226,8 +305,30 @@ impl App {
                     if key.kind == KeyEventKind::Press && key.modifiers == KeyModifiers::NONE =>
                 {
                     self.watch = !self.watch;
-                    self.watch_error = None;
+                    self.read_error = None;
                     self.pending_source = None;
+                    if self.watch && self.snapshot.is_none() {
+                        // watch 開始時点を diff の基準にする。
+                        self.snapshot = Some(self.source.clone());
+                    }
+                }
+                KeyCode::Char('s')
+                    if key.kind == KeyEventKind::Press && key.modifiers == KeyModifiers::NONE =>
+                {
+                    self.toggle_snapshot();
+                }
+                KeyCode::Char('d') if key.modifiers == KeyModifiers::NONE => {
+                    // Repeat も受ける: d を押しっぱなしにすると新旧が交互に
+                    // 切り替わり続け、ブリンク比較がそのまま成立する。
+                    self.advance_diff_view();
+                }
+                KeyCode::Char('r')
+                    if key.kind == KeyEventKind::Press && key.modifiers == KeyModifiers::NONE =>
+                {
+                    self.reload_now();
+                }
+                KeyCode::Esc if self.diff_view != DiffView::Off => {
+                    self.set_diff_view(DiffView::Off);
                 }
                 _ => {}
             },
@@ -236,18 +337,110 @@ impl App {
         false
     }
 
+    /// `s` の反転動作。基準が無ければ今表示している内容 (ディスクではない) を
+    /// 基準として取り、あれば破棄して diff 表示も強制的に閉じる。
+    fn toggle_snapshot(&mut self) {
+        if self.snapshot.is_some() {
+            self.snapshot = None;
+            self.diff = None;
+            self.set_diff_view(DiffView::Off);
+        } else {
+            self.snapshot = Some(self.source.clone());
+            self.diff = None;
+        }
+    }
+
+    /// `d` の遷移: Off → New、以降は New⇄Old。基準が無い間は表示を変えず
+    /// ステータス行へヒントだけ出す。
+    fn advance_diff_view(&mut self) {
+        if self.snapshot.is_none() {
+            self.hint = Some("no snapshot (press s)".to_owned());
+            return;
+        }
+        let next = match self.diff_view {
+            DiffView::Off => DiffView::New,
+            DiffView::New => DiffView::Old,
+            DiffView::Old => DiffView::New,
+        };
+        self.set_diff_view(next);
+    }
+
+    /// 表示層を切り替え、検索対象と表示範囲を新しい行リストへ合わせ直す。
+    /// query は保持され、マッチ行だけが層のテキストで再計算される。
+    fn set_diff_view(&mut self, view: DiffView) {
+        self.diff_view = view;
+        if view != DiffView::Off {
+            self.ensure_diff();
+        }
+        self.rebuild_matches();
+        self.clamp_top();
+        self.clamp_left();
+    }
+
+    /// snapshot と現在の描画行から整列結果を作る。キャッシュがあれば何もしない。
+    fn ensure_diff(&mut self) {
+        if self.diff.is_some() {
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let old_lines = renderer::render_markdown(snapshot, self.width as usize);
+        self.diff = Some(diff::compute(&old_lines, &self.lines));
+    }
+
+    /// 描画・検索・スクロールが対象にする層。diff 表示が Off の間は None を
+    /// 返し、呼び出し側は通常の描画行 (`lines`) を使う。
+    fn active_layer(&self) -> Option<(&[DiffRow], &'static DiffPalette)> {
+        let diff = self.diff.as_ref()?;
+        match self.diff_view {
+            DiffView::Off => None,
+            DiffView::New => Some((&diff.new_rows, &DiffPalette::NEW)),
+            DiffView::Old => Some((&diff.old_rows, &DiffPalette::OLD)),
+        }
+    }
+
+    fn line_count(&self) -> usize {
+        self.active_layer()
+            .map_or(self.lines.len(), |(rows, _)| rows.len())
+    }
+
     fn draw(&mut self, stdout: &mut io::Stdout) -> Result<()> {
         self.clamp_top();
         self.clamp_left();
         let body_height = self.body_height();
+        let width = self.width as usize;
 
         queue!(stdout, Clear(ClearType::All))?;
         for row in 0..body_height {
             let line_index = self.top + row as usize;
             queue!(stdout, MoveTo(0, row))?;
-            if let Some(line) = self.lines.get(line_index) {
+
+            if let Some((rows, palette)) = self.active_layer() {
+                let Some(diff_row) = rows.get(line_index) else {
+                    continue;
+                };
+                let (composed, row_bg) = compose_diff_row(diff_row, palette, &self.query);
+                let visible = slice_line(&composed, self.left, width);
+                draw_line(stdout, &visible)?;
+                if let Some(bg) = row_bg {
+                    // 変更行と filler は行末まで背景を敷き、行の増減が起きた
+                    // 位置をブリンク時に面で追えるようにする。
+                    let pad = width.saturating_sub(display_width(&visible.plain_text()));
+                    if pad > 0 {
+                        let filler = StyledLine::styled(
+                            " ".repeat(pad),
+                            TextStyle {
+                                bg: Some(bg),
+                                ..TextStyle::normal()
+                            },
+                        );
+                        draw_line(stdout, &filler)?;
+                    }
+                }
+            } else if let Some(line) = self.lines.get(line_index) {
                 let highlighted = line_with_search_highlight(line, &self.query);
-                let visible = slice_line(&highlighted, self.left, self.width as usize);
+                let visible = slice_line(&highlighted, self.left, width);
                 draw_line(stdout, &visible)?;
             }
         }
@@ -282,12 +475,10 @@ impl App {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("markdown");
-        let percent = if self.lines.is_empty() {
-            100
-        } else {
-            ((self.top + self.body_height() as usize).min(self.lines.len()) * 100)
-                / self.lines.len()
-        };
+        let line_count = self.line_count();
+        let percent = ((self.top + self.body_height() as usize).min(line_count) * 100)
+            .checked_div(line_count)
+            .unwrap_or(100);
         let query = if self.query.is_empty() {
             String::new()
         } else {
@@ -299,19 +490,32 @@ impl App {
             format!("  col {}", self.left + 1)
         };
 
-        let watch = match &self.watch_error {
-            Some(error) => format!("watch:error ({error})"),
-            None if self.watch => "watch:on".to_owned(),
-            None => "watch:off".to_owned(),
+        let watch = if self.watch { "watch:on" } else { "watch:off" };
+        let snap = match (self.snapshot.is_some(), self.diff_view) {
+            (false, _) => "",
+            (true, DiffView::Off) => "  snap",
+            (true, DiffView::New) => "  snap diff:new",
+            (true, DiffView::Old) => "  snap diff:old",
+        };
+        let error = match &self.read_error {
+            Some(error) => format!("  error ({error})"),
+            None => String::new(),
+        };
+        let hint = match &self.hint {
+            Some(hint) => format!("  {hint}"),
+            None => String::new(),
         };
 
-        format!("{filename}  {percent:>3}%{query}{column}  {watch}  q:quit  /:search  w:watch")
+        format!(
+            "{filename}  {percent:>3}%{query}{column}  {watch}{snap}{error}{hint}  \
+             q:quit  /:search  w:watch  s:snap  d:diff  r:reload"
+        )
     }
 
     /// watch が有効ならファイルを読み直し、画面に見える状態が変わったかを返す。
     ///
     /// 新しい内容は `stage_source` の安定条件を満たしてから renderer へ渡す。
-    /// 読み込み失敗は `watch_error` のみを更新し、最後に確定した表示を保持する。
+    /// 読み込み失敗は `read_error` のみを更新し、最後に確定した表示を保持する。
     fn reload_if_changed(&mut self) -> bool {
         if !self.watch {
             return false;
@@ -319,16 +523,36 @@ impl App {
 
         match fs::read_to_string(&self.path) {
             Ok(source) => {
-                let recovered = self.watch_error.take().is_some();
+                let recovered = self.read_error.take().is_some();
                 self.stage_source(source, Instant::now()) || recovered
             }
             Err(error) => {
                 self.pending_source = None;
                 let error = error.to_string();
-                if self.watch_error.as_deref() == Some(&error) {
+                if self.read_error.as_deref() == Some(&error) {
                     return false;
                 }
-                self.watch_error = Some(error);
+                self.read_error = Some(error);
+                true
+            }
+        }
+    }
+
+    /// `r` の即時再読み込み。watch の周期と安定待ちを使わず、読めた内容を
+    /// その場で反映して画面に見える状態が変わったかを返す。基準は動かさない。
+    fn reload_now(&mut self) -> bool {
+        self.pending_source = None;
+        match fs::read_to_string(&self.path) {
+            Ok(source) => {
+                let recovered = self.read_error.take().is_some();
+                self.replace_source(source) || recovered
+            }
+            Err(error) => {
+                let error = error.to_string();
+                if self.read_error.as_deref() == Some(&error) {
+                    return false;
+                }
+                self.read_error = Some(error);
                 true
             }
         }
@@ -367,19 +591,29 @@ impl App {
 
     /// 読み込み済みの内容を置き換え、renderer の入力が変わったかを返す。
     ///
-    /// 検索語とスクロール位置は引き継ぐ。新しい行数・表示幅から外れた位置だけを
-    /// 末尾へ戻し、検索対象行は新しい描画結果から作り直す。
+    /// 検索語とスクロール位置は引き継ぐ。diff 表示中は基準を保ったまま新層側
+    /// だけが更新され、整列とハイライトが作り直される。
     fn replace_source(&mut self, source: String) -> bool {
         if source == self.source {
             return false;
         }
 
         self.source = source;
+        self.refresh_render();
+        true
+    }
+
+    /// source または表示幅の変化後に、描画行・整列結果・検索対象を作り直し、
+    /// 新しい行数・表示幅から外れたスクロール位置だけを末尾へ戻す。
+    fn refresh_render(&mut self) {
         self.lines = renderer::render_markdown(&self.source, self.width as usize);
+        self.diff = None;
+        if self.diff_view != DiffView::Off {
+            self.ensure_diff();
+        }
         self.rebuild_matches();
         self.clamp_top();
         self.clamp_left();
-        true
     }
 
     fn scroll_lines(&mut self, delta: isize) {
@@ -404,7 +638,7 @@ impl App {
     }
 
     fn max_top(&self) -> usize {
-        self.lines.len().saturating_sub(self.body_height() as usize)
+        self.line_count().saturating_sub(self.body_height() as usize)
     }
 
     fn clamp_top(&mut self) {
@@ -412,17 +646,29 @@ impl App {
     }
 
     fn max_left(&self) -> usize {
-        self.lines
-            .iter()
-            .map(|line| display_width(&line.plain_text()).saturating_sub(self.width as usize))
-            .max()
-            .unwrap_or(0)
+        let width = self.width as usize;
+        let overflow = |text: String| display_width(&text).saturating_sub(width);
+        match self.active_layer() {
+            Some((rows, _)) => rows
+                .iter()
+                .map(|row| overflow(row.line.plain_text()))
+                .max()
+                .unwrap_or(0),
+            None => self
+                .lines
+                .iter()
+                .map(|line| overflow(line.plain_text()))
+                .max()
+                .unwrap_or(0),
+        }
     }
 
     fn clamp_left(&mut self) {
         self.left = self.left.min(self.max_left());
     }
 
+    /// 表示中の行リスト (diff 表示中はその層、通常は描画行) から検索マッチを
+    /// 作り直す。filler 行は空文字列なので自然にマッチしない。
     fn rebuild_matches(&mut self) {
         let query = self.query.to_lowercase();
         if query.is_empty() {
@@ -431,17 +677,25 @@ impl App {
             return;
         }
 
-        self.matches = self
-            .lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| {
-                line.plain_text()
-                    .to_lowercase()
-                    .contains(&query)
-                    .then_some(index)
-            })
-            .collect();
+        let matched = |(index, text): (usize, String)| {
+            text.to_lowercase().contains(&query).then_some(index)
+        };
+        let matches = match self.active_layer() {
+            Some((rows, _)) => rows
+                .iter()
+                .map(|row| row.line.plain_text())
+                .enumerate()
+                .filter_map(matched)
+                .collect(),
+            None => self
+                .lines
+                .iter()
+                .map(StyledLine::plain_text)
+                .enumerate()
+                .filter_map(matched)
+                .collect(),
+        };
+        self.matches = matches;
         self.match_index = None;
     }
 
@@ -489,6 +743,27 @@ impl App {
         self.match_index = Some(previous);
         self.top = self.matches[previous].min(self.max_top());
         self.left = 0;
+    }
+}
+
+/// diff 行へスタイルを重ねる。重ね順は 行 tint → 行内強調 → 検索で、検索が
+/// 最上位になる。返り値の Color は行末まで敷く背景で、Common では None。
+fn compose_diff_row(
+    row: &DiffRow,
+    palette: &DiffPalette,
+    query: &str,
+) -> (StyledLine, Option<Color>) {
+    match &row.kind {
+        RowKind::Common => (line_with_search_highlight(&row.line, query), None),
+        RowKind::Changed { emphasis } => {
+            let tinted = line_with_bg(&row.line, palette.line_bg);
+            let emphasized = line_with_bg_ranges(&tinted, emphasis, palette.emphasis_bg);
+            (
+                line_with_search_highlight(&emphasized, query),
+                Some(palette.line_bg),
+            )
+        }
+        RowKind::Filler => (StyledLine::empty(), Some(palette.filler_bg)),
     }
 }
 
@@ -587,6 +862,10 @@ mod tests {
         }
     }
 
+    fn press(code: KeyCode) -> KeyEvent {
+        key(code, KeyEventKind::Press, KeyModifiers::NONE)
+    }
+
     #[test]
     fn toggles_watch_only_on_plain_w_press() {
         let mut app = app("before", false);
@@ -632,14 +911,24 @@ mod tests {
         let mut app = app("before", false);
         app.mode = Mode::SearchInput(String::new());
 
-        app.handle_key(key(
-            KeyCode::Char('w'),
-            KeyEventKind::Press,
-            KeyModifiers::NONE,
-        ));
+        app.handle_key(press(KeyCode::Char('w')));
 
         assert!(!app.watch);
         assert!(matches!(&app.mode, Mode::SearchInput(input) if input == "w"));
+    }
+
+    #[test]
+    fn keeps_snapshot_keys_as_search_input() {
+        let mut app = app("before", false);
+        app.mode = Mode::SearchInput(String::new());
+
+        app.handle_key(press(KeyCode::Char('s')));
+        app.handle_key(press(KeyCode::Char('d')));
+        app.handle_key(press(KeyCode::Char('r')));
+
+        assert!(app.snapshot.is_none());
+        assert_eq!(app.diff_view, DiffView::Off);
+        assert!(matches!(&app.mode, Mode::SearchInput(input) if input == "sdr"));
     }
 
     #[test]
@@ -662,7 +951,7 @@ mod tests {
             .collect::<Vec<_>>();
         fs::remove_file(&file.path).unwrap();
         assert!(app.reload_if_changed());
-        assert!(app.watch_error.is_some());
+        assert!(app.read_error.is_some());
         assert_eq!(app.source, "after");
         assert_eq!(app.query, "kept query");
         assert_eq!(app.top, 7);
@@ -678,7 +967,7 @@ mod tests {
 
         fs::write(&file.path, "after").unwrap();
         assert!(app.reload_if_changed());
-        assert!(app.watch_error.is_none());
+        assert!(app.read_error.is_none());
 
         fs::write(&file.path, "recovered").unwrap();
         assert!(!app.reload_if_changed());
@@ -744,23 +1033,22 @@ mod tests {
         assert_eq!(app.source, "in memory");
         assert!(app.status_text().contains("watch:off"));
         assert!(app.status_text().contains("w:watch"));
+        assert!(app.status_text().contains("s:snap"));
+        assert!(app.status_text().contains("d:diff"));
+        assert!(app.status_text().contains("r:reload"));
 
         app.watch = true;
         assert!(app.status_text().contains("watch:on"));
-        app.watch_error = Some("read failed".to_owned());
+        app.read_error = Some("read failed".to_owned());
         app.pending_source = Some(PendingSource {
             source: "pending".to_owned(),
             first_seen: Instant::now(),
         });
-        assert!(app.status_text().contains("watch:error"));
+        assert!(app.status_text().contains("error (read failed)"));
 
-        app.handle_key(key(
-            KeyCode::Char('w'),
-            KeyEventKind::Press,
-            KeyModifiers::NONE,
-        ));
+        app.handle_key(press(KeyCode::Char('w')));
         assert!(!app.watch);
-        assert!(app.watch_error.is_none());
+        assert!(app.read_error.is_none());
         assert!(app.pending_source.is_none());
     }
 
@@ -774,5 +1062,164 @@ mod tests {
         assert!(app.stage_source("latest".to_owned(), started + WATCH_MAX_SETTLE_TIME));
         assert_eq!(app.source, "latest");
         assert!(app.pending_source.is_none());
+    }
+
+    #[test]
+    fn snapshot_toggle_and_diff_flip_flow() {
+        let mut app = app("alpha\n\nbeta", false);
+        assert!(app.snapshot.is_none());
+
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.diff_view, DiffView::Off);
+        assert_eq!(app.hint.as_deref(), Some("no snapshot (press s)"));
+
+        app.handle_key(press(KeyCode::Char('s')));
+        assert_eq!(app.snapshot.as_deref(), Some("alpha\n\nbeta"));
+        assert!(app.hint.is_none());
+        assert_eq!(app.diff_view, DiffView::Off);
+
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.diff_view, DiffView::New);
+        assert!(app.diff.is_some());
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.diff_view, DiffView::Old);
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.diff_view, DiffView::New);
+
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.diff_view, DiffView::Off);
+        assert!(app.snapshot.is_some());
+    }
+
+    #[test]
+    fn discarding_snapshot_forces_diff_off() {
+        let mut app = app("content", false);
+
+        app.handle_key(press(KeyCode::Char('s')));
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.diff_view, DiffView::New);
+
+        app.handle_key(press(KeyCode::Char('s')));
+        assert!(app.snapshot.is_none());
+        assert_eq!(app.diff_view, DiffView::Off);
+        assert!(app.diff.is_none());
+    }
+
+    #[test]
+    fn watch_enable_takes_snapshot_only_when_missing() {
+        let mut app = app("first", false);
+
+        app.handle_key(press(KeyCode::Char('w')));
+        assert!(app.watch);
+        assert_eq!(app.snapshot.as_deref(), Some("first"));
+
+        app.replace_source("second".to_owned());
+        app.handle_key(press(KeyCode::Char('w')));
+        assert!(!app.watch);
+        assert_eq!(app.snapshot.as_deref(), Some("first"));
+
+        app.handle_key(press(KeyCode::Char('w')));
+        assert!(app.watch);
+        assert_eq!(app.snapshot.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn watch_startup_takes_initial_snapshot() {
+        let watching = app("initial", true);
+        assert_eq!(watching.snapshot.as_deref(), Some("initial"));
+
+        let plain = app("initial", false);
+        assert!(plain.snapshot.is_none());
+    }
+
+    #[test]
+    fn manual_reload_applies_immediately_and_reports_errors() {
+        let file = TestFile::new("after");
+        let mut app = App::new(file.path.clone(), "before".to_owned(), 80, 24, false);
+        app.handle_key(press(KeyCode::Char('s')));
+
+        app.handle_key(press(KeyCode::Char('r')));
+        assert_eq!(app.source, "after");
+        assert_eq!(app.snapshot.as_deref(), Some("before"));
+
+        fs::remove_file(&file.path).unwrap();
+        app.handle_key(press(KeyCode::Char('r')));
+        assert!(app.read_error.is_some());
+        assert_eq!(app.source, "after");
+
+        fs::write(&file.path, "recovered").unwrap();
+        app.handle_key(press(KeyCode::Char('r')));
+        assert!(app.read_error.is_none());
+        assert_eq!(app.source, "recovered");
+        assert_eq!(app.snapshot.as_deref(), Some("before"));
+    }
+
+    #[test]
+    fn manual_reload_bypasses_stability_wait() {
+        let file = TestFile::new("initial");
+        let mut app = App::new(file.path.clone(), "initial".to_owned(), 80, 24, true);
+        app.pending_source = Some(PendingSource {
+            source: "half written".to_owned(),
+            first_seen: Instant::now(),
+        });
+
+        fs::write(&file.path, "settled").unwrap();
+        assert!(app.reload_now());
+
+        assert_eq!(app.source, "settled");
+        assert!(app.pending_source.is_none());
+    }
+
+    #[test]
+    fn search_targets_the_displayed_layer() {
+        let mut app = app("grape", false);
+        app.handle_key(press(KeyCode::Char('s')));
+        app.replace_source("apple".to_owned());
+        app.query = "grape".to_owned();
+
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.diff_view, DiffView::New);
+        assert!(app.matches.is_empty());
+
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.diff_view, DiffView::Old);
+        assert_eq!(app.matches.len(), 1);
+    }
+
+    #[test]
+    fn status_shows_snapshot_and_diff_state() {
+        // キーヘルプにも "s:snap" が常に出るため、状態は watch 表示に続く
+        // セグメントの並びで判定する。
+        let mut app = app("content", false);
+        assert!(!app.status_text().contains("watch:off  snap"));
+
+        app.handle_key(press(KeyCode::Char('s')));
+        assert!(app.status_text().contains("watch:off  snap"));
+        assert!(!app.status_text().contains("diff:"));
+
+        app.handle_key(press(KeyCode::Char('d')));
+        assert!(app.status_text().contains("snap diff:new"));
+
+        app.handle_key(press(KeyCode::Char('d')));
+        assert!(app.status_text().contains("snap diff:old"));
+    }
+
+    #[test]
+    fn diff_layers_align_and_viewport_follows_active_layer() {
+        let mut app = app("a\n\nb\n\nc", false);
+        app.handle_key(press(KeyCode::Char('s')));
+        app.replace_source("a\n\nc".to_owned());
+
+        app.handle_key(press(KeyCode::Char('d')));
+        let (new_rows, _) = app.active_layer().unwrap();
+        let aligned = new_rows.len();
+        assert_eq!(app.line_count(), aligned);
+
+        app.handle_key(press(KeyCode::Char('d')));
+        let (old_rows, _) = app.active_layer().unwrap();
+        assert_eq!(old_rows.len(), aligned);
+
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.line_count(), app.lines.len());
     }
 }

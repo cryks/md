@@ -10,5 +10,7 @@ clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
 mermaid-text = "0.56"
 pulldown-cmark = "0.13"
+similar = "2"
 syntect = "5"
+unicode-segmentation = "1"
 unicode-width = "0.2"
