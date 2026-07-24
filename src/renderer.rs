@@ -8,9 +8,26 @@ use crate::{
     table,
 };
 
-pub(crate) fn render_markdown(source: &str, width: usize) -> Vec<StyledLine> {
+pub(crate) fn render_markdown(source: &str, width: usize) -> RenderedDoc {
     let mut renderer = MarkdownRenderer::new(width);
     renderer.render(source)
+}
+
+/// 描画行と、pager の sticky 表示が参照する見出し位置。
+pub(crate) struct RenderedDoc {
+    pub(crate) lines: Vec<StyledLine>,
+    /// h1-h3 の位置 (line 昇順)。h4 以下は sticky 対象外なので記録しない。
+    /// h3 までという境界は `TextStyle::heading` の「色付きは h3 まで」と同じ。
+    pub(crate) headings: Vec<Heading>,
+}
+
+/// `RenderedDoc::lines` 内の見出し 1 個。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Heading {
+    /// 見出しの行 index。テキストが長く折り返された場合は先頭行を指す。
+    pub(crate) line: usize,
+    /// ATX 見出しレベル (1..=3)。
+    pub(crate) level: usize,
 }
 
 struct MarkdownRenderer {
@@ -37,11 +54,12 @@ impl MarkdownRenderer {
         }
     }
 
-    fn render(&mut self, source: &str) -> Vec<StyledLine> {
+    fn render(&mut self, source: &str) -> RenderedDoc {
         let _ = Parser::new_ext(source, markdown_options()).count();
 
         let lines = source.lines().collect::<Vec<_>>();
         let mut output = Vec::new();
+        let mut headings = Vec::new();
         let mut index = 0usize;
 
         while index < lines.len() {
@@ -63,10 +81,17 @@ impl MarkdownRenderer {
                 continue;
             }
 
-            if let Some((level, _)) = heading_at(lines[index])
-                && level <= 2
-            {
-                pad_section_gap(&mut output);
+            if let Some((level, _)) = heading_at(lines[index]) {
+                if level <= 2 {
+                    pad_section_gap(&mut output);
+                }
+                // pad_section_gap の後に記録し、挿入された空行込みの位置を指す。
+                if level <= 3 {
+                    headings.push(Heading {
+                        line: output.len(),
+                        level,
+                    });
+                }
             }
 
             output.extend(wrap_lines(
@@ -80,7 +105,10 @@ impl MarkdownRenderer {
             output.push(StyledLine::empty());
         }
 
-        output
+        RenderedDoc {
+            lines: output,
+            headings,
+        }
     }
 
     fn frontmatter_at(&self, lines: &[&str], start: usize) -> Option<(usize, Vec<StyledLine>)> {
@@ -337,6 +365,7 @@ mod tests {
     fn renders_table_as_box() {
         let source = "| name | value |\n| --- | ---: |\n| alpha | 10 |";
         let output = render_markdown(source, 80)
+            .lines
             .into_iter()
             .map(|line| line.plain_text())
             .collect::<Vec<_>>()
@@ -350,6 +379,7 @@ mod tests {
     fn renders_mermaid_block_as_diagram() {
         let source = "```mermaid\ngraph LR; A[Build] --> B[Test]\n```";
         let output = render_markdown(source, 80)
+            .lines
             .into_iter()
             .map(|line| line.plain_text())
             .collect::<Vec<_>>()
@@ -362,7 +392,7 @@ mod tests {
 
     #[test]
     fn highlights_yaml_frontmatter() {
-        let lines = render_markdown("---\ntitle: Hello\n---\n# Body", 80);
+        let lines = render_markdown("---\ntitle: Hello\n---\n# Body", 80).lines;
 
         assert_eq!(lines[0].plain_text(), "---");
         assert_eq!(lines[2].plain_text(), "---");
@@ -376,7 +406,7 @@ mod tests {
 
     #[test]
     fn renders_list_item_with_subtle_marker() {
-        let lines = render_markdown("- alpha", 80);
+        let lines = render_markdown("- alpha", 80).lines;
 
         assert_eq!(lines[0].plain_text(), "- alpha");
         assert!(
@@ -395,7 +425,7 @@ mod tests {
 
     #[test]
     fn h1_and_h2_extend_rule_to_terminal_width() {
-        let lines = render_markdown("# Title\n\ntext\n\n## Section", 40);
+        let lines = render_markdown("# Title\n\ntext\n\n## Section", 40).lines;
 
         let h1 = &lines[0];
         assert_eq!(display_width(&h1.plain_text()), 40);
@@ -411,7 +441,7 @@ mod tests {
 
     #[test]
     fn h3_rule_extends_to_half_width() {
-        let lines = render_markdown("### Section", 40);
+        let lines = render_markdown("### Section", 40).lines;
 
         assert_eq!(display_width(&lines[0].plain_text()), 20);
         assert!(lines[0].plain_text().ends_with('─'));
@@ -419,7 +449,7 @@ mod tests {
 
     #[test]
     fn h4_has_no_rule() {
-        let lines = render_markdown("#### Section", 40);
+        let lines = render_markdown("#### Section", 40).lines;
 
         assert_eq!(lines[0].plain_text(), "#### Section");
     }
@@ -427,7 +457,7 @@ mod tests {
     #[test]
     fn skips_rule_when_heading_leaves_no_room() {
         // 区切り空白 1 + 罫線 3 セルが入らない幅では罫線を引かない
-        let lines = render_markdown("## abcdef", 12);
+        let lines = render_markdown("## abcdef", 12).lines;
 
         assert!(!lines[0].plain_text().contains('─'));
     }
@@ -435,6 +465,7 @@ mod tests {
     #[test]
     fn h2_gets_two_blank_lines_before_it() {
         let texts = render_markdown("body\n\n## Section", 40)
+            .lines
             .into_iter()
             .map(|line| line.plain_text())
             .collect::<Vec<_>>();
@@ -447,15 +478,35 @@ mod tests {
 
     #[test]
     fn leading_heading_gets_no_extra_blank() {
-        let lines = render_markdown("# Title", 40);
+        let lines = render_markdown("# Title", 40).lines;
 
         assert!(lines[0].plain_text().starts_with("# Title"));
     }
 
     #[test]
+    fn heading_positions_point_at_their_lines() {
+        // pad_section_gap が h2 の前へ挿入する空行込みで line が実位置を指し、
+        // h4 は headings に入らない。
+        let doc = render_markdown("# A\n\nbody\n\n## B\n\ntext\n\n#### deep\n\n### C", 40);
+
+        let described = doc
+            .headings
+            .iter()
+            .map(|heading| (heading.level, doc.lines[heading.line].plain_text()))
+            .collect::<Vec<_>>();
+        assert_eq!(described.len(), 3);
+        assert_eq!(described[0].0, 1);
+        assert!(described[0].1.starts_with("# A"));
+        assert_eq!(described[1].0, 2);
+        assert!(described[1].1.starts_with("## B"));
+        assert_eq!(described[2].0, 3);
+        assert!(described[2].1.starts_with("### C"));
+    }
+
+    #[test]
     fn preserves_code_block_overflow_for_horizontal_scroll() {
         let source = "```text\nabcdefghijklmnopqrstuvwxyz\n```";
-        let lines = render_markdown(source, 10);
+        let lines = render_markdown(source, 10).lines;
 
         assert!(
             lines

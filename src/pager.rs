@@ -21,14 +21,17 @@ use crossterm::{
     execute, queue,
     style::{Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{
-        self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
+        EnterAlternateScreen, LeaveAlternateScreen, ScrollDown, ScrollUp, disable_raw_mode,
         enable_raw_mode,
     },
 };
 
 use crate::{
     diff::{self, DiffLayers, DiffRow, RowKind},
-    renderer, style,
+    renderer,
+    renderer::Heading,
+    style,
     style::{
         StyledLine, TextStyle, display_width, line_with_bg, line_with_bg_ranges,
         line_with_search_highlight, slice_line,
@@ -212,10 +215,29 @@ struct PendingSource {
     first_seen: Instant,
 }
 
+/// 直前に端末へ送ったフレームを決めた入力。次のフレームとの差が `top` だけ
+/// なら、画面の既存行をスクロール領域の移動で再利用できる (`scroll_frame`)。
+/// `render_gen` 以外のフィールドはそれぞれ本文の描画内容を直接変える入力で、
+/// どれか 1 つでも違えばフル再描画に落とす。
+struct FrameState {
+    /// 描画行の世代。`refresh_render` (内容・幅の変化) ごとに進む。
+    render_gen: u64,
+    top: usize,
+    left: usize,
+    width: u16,
+    height: u16,
+    diff_view: DiffView,
+    query: String,
+    sticky: Vec<usize>,
+}
+
 struct App {
     path: PathBuf,
     source: String,
     lines: Vec<StyledLine>,
+    /// `lines` 内の h1-h3 の位置。sticky 表示の計算だけが読み、`lines` と
+    /// 同時に作り直す。
+    headings: Vec<Heading>,
     width: u16,
     height: u16,
     top: usize,
@@ -241,16 +263,21 @@ struct App {
     diff: Option<DiffLayers>,
     /// 次のキー入力まで表示する操作ヒント。snapshot 無しで `d` を押した場合に出す。
     hint: Option<String>,
+    /// 描画行の世代。`refresh_render` が進め、`FrameState` との比較だけに使う。
+    render_gen: u64,
+    /// 直前フレームの入力。初回描画の前は None。
+    last_frame: Option<FrameState>,
 }
 
 impl App {
     fn new(path: PathBuf, source: String, width: u16, height: u16, watch: bool) -> Self {
-        let lines = renderer::render_markdown(&source, width as usize);
+        let doc = renderer::render_markdown(&source, width as usize);
         let snapshot = watch.then(|| source.clone());
         Self {
             path,
             source,
-            lines,
+            lines: doc.lines,
+            headings: doc.headings,
             width,
             height,
             top: 0,
@@ -266,6 +293,8 @@ impl App {
             diff_view: DiffView::Off,
             diff: None,
             hint: None,
+            render_gen: 0,
+            last_frame: None,
         }
     }
 
@@ -414,7 +443,7 @@ impl App {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        let old_lines = renderer::render_markdown(snapshot, self.width as usize);
+        let old_lines = renderer::render_markdown(snapshot, self.width as usize).lines;
         self.diff = Some(diff::compute(&old_lines, &self.lines));
     }
 
@@ -435,23 +464,125 @@ impl App {
     }
 
     fn draw(&mut self, stdout: &mut io::Stdout) -> Result<()> {
+        let frame = self.render_frame()?;
+        stdout.write_all(&frame)?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    /// 1 フレームをバッファへ組み立てて返す。呼び出し側が 1 回の write で
+    /// 流すことが前提で、stdout へ直接 queue すると内部バッファを跨いだ
+    /// 時点で途中までの絵が端末に届き、塗り替え中の行が一瞬見える。
+    ///
+    /// フレームは 2 通りの組み立て方を持つ。直前フレームとの差が縦
+    /// スクロールだけなら `scroll_frame` が画面の既存行を端末側の移動で
+    /// 再利用し、露出した行とステータス行だけを描く。それ以外はフル
+    /// 再描画で、全画面クリアはせず全行を上書きして行末の残りだけ消す。
+    /// 各行はフレーム内で一度だけ塗り、sticky に覆われる行の本文は最初
+    /// から描かない。フレームの反映が途中で切れても画面に出るのは前
+    /// フレームの行であって、空白行や上書き前の中間状態ではない。
+    /// Synchronized Update 対応端末ではフレーム全体が原子的に反映される。
+    fn render_frame(&mut self) -> Result<Vec<u8>> {
         self.clamp_top();
         self.clamp_left();
-        let body_height = self.body_height();
+        let sticky = self.sticky_heading_lines();
+
+        let mut frame: Vec<u8> = Vec::new();
+        queue!(frame, BeginSynchronizedUpdate)?;
+
+        if !self.scroll_frame(&mut frame, &sticky)? {
+            self.draw_sticky(&mut frame, &sticky)?;
+            for row in sticky_area_height(sticky.len())..self.body_height() as usize {
+                self.draw_body_row(&mut frame, row)?;
+            }
+            if matches!(self.mode, Mode::Help) {
+                self.draw_help(&mut frame)?;
+            }
+        }
+
+        self.draw_status(&mut frame)?;
+        queue!(frame, EndSynchronizedUpdate)?;
+
+        self.last_frame = Some(FrameState {
+            render_gen: self.render_gen,
+            top: self.top,
+            left: self.left,
+            width: self.width,
+            height: self.height,
+            diff_view: self.diff_view,
+            query: self.query.clone(),
+            sticky,
+        });
+        Ok(frame)
+    }
+
+    /// 直前フレームとの差が縦スクロールだけの場合、本文領域をスクロール
+    /// 領域 (DECSTBM) として端末側で `delta` 行ずらし、露出した行だけを
+    /// 描いて true を返す。sticky・覆われていない既存行・ヘルプ以外の
+    /// 画面は動かないので、送るバイト数が全行描画に比べて桁で減る。
+    ///
+    /// 適用条件: Normal モードで、本文の描画内容を決める入力 (内容世代・
+    /// left・幅・高さ・diff 層・検索語・sticky チェーン) が前フレームと
+    /// 一致し、移動量が本文領域の高さ未満であること。ヘルプ表示中は
+    /// スクロールキー自体が届かない (最初の 1 打で閉じる) ので、パネルを
+    /// 消し忘れる経路はない。
+    fn scroll_frame(&self, frame: &mut Vec<u8>, sticky: &[usize]) -> Result<bool> {
+        let Some(last) = &self.last_frame else {
+            return Ok(false);
+        };
+        if !matches!(self.mode, Mode::Normal)
+            || last.render_gen != self.render_gen
+            || last.left != self.left
+            || last.width != self.width
+            || last.height != self.height
+            || last.diff_view != self.diff_view
+            || last.query != self.query
+            || last.sticky != sticky
+        {
+            return Ok(false);
+        }
+
+        let area_top = sticky_area_height(sticky.len());
+        let body_height = self.body_height() as usize;
+        let area_height = body_height - area_top;
+        let delta = self.top as isize - last.top as isize;
+        if delta == 0 || delta.unsigned_abs() >= area_height {
+            return Ok(false);
+        }
+
+        // DECSTBM は crossterm に無いので raw で送る (1 始まりの閉区間)。
+        // SU/SD は指定領域内だけを動かし、ステータス行と sticky は領域外に
+        // なるので触られない。解除 (CSI r) でカーソルは home へ動くが、
+        // 以降の描画は毎回 MoveTo するので影響しない。
+        write!(frame, "\x1b[{};{}r", area_top + 1, body_height)?;
+        let amount = delta.unsigned_abs() as u16;
+        let exposed = if delta > 0 {
+            queue!(frame, ScrollUp(amount))?;
+            body_height - amount as usize..body_height
+        } else {
+            queue!(frame, ScrollDown(amount))?;
+            area_top..area_top + amount as usize
+        };
+        write!(frame, "\x1b[r")?;
+
+        for row in exposed {
+            self.draw_body_row(frame, row)?;
+        }
+        Ok(true)
+    }
+
+    /// 本文 1 行を画面の `row` 行目へ塗る。表示する行が無い位置は行クリア
+    /// だけになり、前フレームの内容が残らない。
+    fn draw_body_row(&self, frame: &mut Vec<u8>, row: usize) -> Result<()> {
+        let line_index = self.top + row;
         let width = self.width as usize;
+        queue!(frame, MoveTo(0, row as u16))?;
 
-        queue!(stdout, Clear(ClearType::All))?;
-        for row in 0..body_height {
-            let line_index = self.top + row as usize;
-            queue!(stdout, MoveTo(0, row))?;
-
-            if let Some((rows, palette)) = self.active_layer() {
-                let Some(diff_row) = rows.get(line_index) else {
-                    continue;
-                };
+        if let Some((rows, palette)) = self.active_layer() {
+            if let Some(diff_row) = rows.get(line_index) {
                 let (composed, row_bg) = compose_diff_row(diff_row, palette, &self.query);
                 let visible = slice_line(&composed, self.left, width);
-                draw_line(stdout, &visible)?;
+                draw_line(frame, &visible)?;
                 if let Some(bg) = row_bg {
                     // 変更行と filler は行末まで背景を敷き、行の増減が起きた
                     // 位置をブリンク時に面で追えるようにする。
@@ -464,31 +595,126 @@ impl App {
                                 ..TextStyle::normal()
                             },
                         );
-                        draw_line(stdout, &filler)?;
+                        draw_line(frame, &filler)?;
                     }
                 }
-            } else if let Some(line) = self.lines.get(line_index) {
-                let highlighted = line_with_search_highlight(line, &self.query);
-                let visible = slice_line(&highlighted, self.left, width);
-                draw_line(stdout, &visible)?;
             }
+        } else if let Some(line) = self.lines.get(line_index) {
+            let highlighted = line_with_search_highlight(line, &self.query);
+            let visible = slice_line(&highlighted, self.left, width);
+            draw_line(frame, &visible)?;
         }
 
-        if matches!(self.mode, Mode::Help) {
-            self.draw_help(stdout)?;
-        }
-
-        self.draw_status(stdout)?;
-        stdout.flush()?;
+        queue!(frame, Clear(ClearType::UntilNewLine))?;
         Ok(())
     }
 
-    fn draw_status(&self, stdout: &mut io::Stdout) -> Result<()> {
+    /// sticky 表示する見出しの行 index を h1 側から返す。diff 表示中は行
+    /// index が層のものになり `headings` と対応しないため、常に空。
+    ///
+    /// チェーンは「境界より上にある h1-h3」をスタックで畳んだもの: 深い
+    /// レベルは、後から同じか浅いレベルの見出しが来た時点でそのセクションが
+    /// 閉じているので落とす。
+    fn sticky_heading_lines(&self) -> Vec<usize> {
+        if self.diff_view != DiffView::Off {
+            return Vec::new();
+        }
+
+        // 本文が半分以上隠れる端末では、いま読んでいる場所に近い深い
+        // レベルを優先し、浅い方から削る。
+        let budget = self.body_height() as usize / 2;
+        let max_count = budget.saturating_sub(1) / 2;
+
+        let chain_above = |boundary: usize| {
+            let mut chain: Vec<&Heading> = Vec::new();
+            for heading in &self.headings {
+                if heading.line >= boundary {
+                    break;
+                }
+                while chain.last().is_some_and(|last| last.level >= heading.level) {
+                    chain.pop();
+                }
+                chain.push(heading);
+            }
+            chain.drain(..chain.len().saturating_sub(max_count));
+            chain
+        };
+
+        // 画面上端を境界にした基本チェーン。この領域に覆われる範囲には
+        // 次セクションの見出しが入りうる。本文が見え始めているのに前の
+        // セクションを出し続けないよう、境界を覆われる範囲の下端まで
+        // 一度だけ広げて計算し直す。広げた結果が自身の領域からはみ出す
+        // (= まだ見えている見出し行と二重表示になる) 場合は基本チェーンへ
+        // 戻す。境界を動的に追い続けると領域の伸縮でチェーンが振動して
+        // 定まらないことがあるため、拡張は一度で打ち切る。
+        let baseline = chain_above(self.top);
+        let candidate = chain_above(self.top + sticky_area_height(baseline.len()));
+        let extent = self.top + sticky_area_height(candidate.len());
+        let chain = if candidate.iter().all(|heading| heading.line < extent) {
+            candidate
+        } else {
+            baseline
+        };
+        chain.into_iter().map(|heading| heading.line).collect()
+    }
+
+    fn sticky_height(&self) -> usize {
+        sticky_area_height(self.sticky_heading_lines().len())
+    }
+
+    /// 見出しチェーンを本文の上へ重ねる。行を覆う overlay なのでスクロール
+    /// 位置の解釈は変えず、覆われた行は上へ抜ける前に必ず一度は非覆域を
+    /// 通る (ページ送りだけ `scroll_pages` が送り量で補正する)。
+    fn draw_sticky(&self, frame: &mut Vec<u8>, indexes: &[usize]) -> Result<()> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+
+        let width = self.width as usize;
+        let blank = StyledLine::styled(
+            " ".repeat(width),
+            TextStyle {
+                bg: Some(style::STATUS_BG),
+                ..TextStyle::normal()
+            },
+        );
+
+        // 上端 padding 1 行 + (見出し + padding 1 行) の繰り返し。見出し間の
+        // padding は上下で共有され、最後の 1 行が本文との境界になる。
+        let mut row = 0u16;
+        queue!(frame, MoveTo(0, row))?;
+        draw_line(frame, &blank)?;
+        row += 1;
+
+        for &line_index in indexes {
+            let highlighted = line_with_search_highlight(&self.lines[line_index], &self.query);
+            let visible = slice_line(&highlighted, self.left, width);
+            let mut composed = line_with_bg(&visible, style::STATUS_BG);
+            let pad = width.saturating_sub(display_width(&composed.plain_text()));
+            composed.push(
+                " ".repeat(pad),
+                TextStyle {
+                    bg: Some(style::STATUS_BG),
+                    ..TextStyle::normal()
+                },
+            );
+
+            queue!(frame, MoveTo(0, row))?;
+            draw_line(frame, &composed)?;
+            row += 1;
+            queue!(frame, MoveTo(0, row))?;
+            draw_line(frame, &blank)?;
+            row += 1;
+        }
+        Ok(())
+    }
+
+    fn draw_status(&self, frame: &mut Vec<u8>) -> Result<()> {
         let row = self.height.saturating_sub(1);
         let bar = line_with_bg(&self.status_line(self.width as usize), self.status_bg());
 
-        queue!(stdout, MoveTo(0, row))?;
-        draw_line(stdout, &bar)
+        queue!(frame, MoveTo(0, row))?;
+        draw_line(frame, &bar)
     }
 
     /// バーの地色。検索入力中と読み込み失敗中だけ色相を変える。失敗表示は
@@ -622,7 +848,7 @@ impl App {
 
     /// キー一覧を本文の上へ中央寄せで重ねる。枠が収まらない端末では何も
     /// 描かず、ステータス行の `?:help` だけを残す。
-    fn draw_help(&self, stdout: &mut io::Stdout) -> Result<()> {
+    fn draw_help(&self, frame: &mut Vec<u8>) -> Result<()> {
         let widest = |widths: &mut dyn Iterator<Item = usize>| widths.max().unwrap_or(0);
         let key_width = widest(&mut HELP_KEYS.iter().map(|(keys, _)| display_width(keys)));
         let action_width = widest(&mut HELP_KEYS.iter().map(|(_, action)| display_width(action)));
@@ -674,8 +900,8 @@ impl App {
             .chain(std::iter::once(bottom));
 
         for (offset, row) in rows.enumerate() {
-            queue!(stdout, MoveTo(x, y + offset as u16))?;
-            draw_line(stdout, &line_with_bg(&row, style::STATUS_BG))?;
+            queue!(frame, MoveTo(x, y + offset as u16))?;
+            draw_line(frame, &line_with_bg(&row, style::STATUS_BG))?;
         }
         Ok(())
     }
@@ -774,7 +1000,10 @@ impl App {
     /// source または表示幅の変化後に、描画行・整列結果・検索対象を作り直し、
     /// 新しい行数・表示幅から外れたスクロール位置だけを末尾へ戻す。
     fn refresh_render(&mut self) {
-        self.lines = renderer::render_markdown(&self.source, self.width as usize);
+        let doc = renderer::render_markdown(&self.source, self.width as usize);
+        self.lines = doc.lines;
+        self.headings = doc.headings;
+        self.render_gen += 1;
         self.diff = None;
         if self.diff_view != DiffView::Off {
             self.ensure_diff();
@@ -789,7 +1018,11 @@ impl App {
     }
 
     fn scroll_pages(&mut self, delta: isize) {
-        let amount = self.body_height().max(1) as isize;
+        // sticky に覆われた行はページ単位のジャンプだと一度も画面へ出ない
+        // まま上へ抜けるので、覆い分だけ送りを縮めて読み飛ばしを防ぐ。
+        let amount = (self.body_height() as usize)
+            .saturating_sub(self.sticky_height())
+            .max(1) as isize;
         self.scroll_lines(delta * amount);
     }
 
@@ -914,6 +1147,13 @@ impl App {
     }
 }
 
+/// 見出し `count` 個の sticky 領域の高さ。見出しの上下に padding を 1 行
+/// ずつ置き、隣接する見出し間では共有するので `count > 0` で `2 * count + 1`。
+/// 0 なら領域ごと出さない。
+fn sticky_area_height(count: usize) -> usize {
+    if count == 0 { 0 } else { 2 * count + 1 }
+}
+
 /// diff 行へスタイルを重ねる。重ね順は 行 tint → 行内強調 → 検索で、検索が
 /// 最上位になる。返り値の Color は行末まで敷く背景で、Common では None。
 fn compose_diff_row(
@@ -935,33 +1175,33 @@ fn compose_diff_row(
     }
 }
 
-fn draw_line(stdout: &mut io::Stdout, line: &StyledLine) -> Result<()> {
+fn draw_line(frame: &mut Vec<u8>, line: &StyledLine) -> Result<()> {
     for span in &line.spans {
-        apply_style(stdout, span.style)?;
-        queue!(stdout, Print(&span.text))?;
+        apply_style(frame, span.style)?;
+        queue!(frame, Print(&span.text))?;
     }
     queue!(
-        stdout,
+        frame,
         SetAttribute(crossterm::style::Attribute::Reset),
         ResetColor
     )?;
     Ok(())
 }
 
-fn apply_style(stdout: &mut io::Stdout, style: TextStyle) -> Result<()> {
+fn apply_style(frame: &mut Vec<u8>, style: TextStyle) -> Result<()> {
     queue!(
-        stdout,
+        frame,
         SetAttribute(crossterm::style::Attribute::Reset),
         ResetColor
     )?;
     if let Some(fg) = style.fg {
-        queue!(stdout, SetForegroundColor(fg))?;
+        queue!(frame, SetForegroundColor(fg))?;
     }
     if let Some(bg) = style.bg {
-        queue!(stdout, SetBackgroundColor(bg))?;
+        queue!(frame, SetBackgroundColor(bg))?;
     }
     for attribute in style.attributes() {
-        queue!(stdout, SetAttribute(attribute))?;
+        queue!(frame, SetAttribute(attribute))?;
     }
     Ok(())
 }
@@ -1419,6 +1659,169 @@ mod tests {
         app.handle_key(press(KeyCode::Char('G')));
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.top, 0);
+    }
+
+    /// h1 → h2 → h3 → h2 の章立て。見出し位置はテストが `headings` から
+    /// 引くので、本文の行数はスクロール余地が十分にあればよい。
+    fn sectioned_app() -> App {
+        let mut source = String::from("# A\n");
+        source.push_str(&"a\n".repeat(20));
+        source.push_str("## B\n");
+        source.push_str(&"b\n".repeat(20));
+        source.push_str("### C\n");
+        source.push_str(&"c\n".repeat(20));
+        source.push_str("## D\n");
+        source.push_str(&"d\n".repeat(20));
+        app(&source, false)
+    }
+
+    #[test]
+    fn sticky_shows_ancestor_headings_above_the_viewport() {
+        let mut app = sectioned_app();
+        let headings = app.headings.clone();
+        assert!(app.sticky_heading_lines().is_empty());
+
+        app.top = headings[2].line + 2;
+        assert_eq!(
+            app.sticky_heading_lines(),
+            vec![headings[0].line, headings[1].line, headings[2].line]
+        );
+    }
+
+    #[test]
+    fn sticky_drops_subsections_closed_by_a_later_heading() {
+        let mut app = sectioned_app();
+        let headings = app.headings.clone();
+
+        // ## D を過ぎると ### C のセクションは閉じている。
+        app.top = headings[3].line + 1;
+        assert_eq!(
+            app.sticky_heading_lines(),
+            vec![headings[0].line, headings[3].line]
+        );
+    }
+
+    #[test]
+    fn sticky_promotes_a_heading_covered_by_the_area() {
+        let mut app = sectioned_app();
+        let headings = app.headings.clone();
+
+        // ## D はまだ top より下だが sticky 領域に覆われる位置にいる。
+        // 本文は D のセクションへ入っているので、B ではなく D を出す。
+        app.top = headings[3].line - 2;
+        assert_eq!(
+            app.sticky_heading_lines(),
+            vec![headings[0].line, headings[3].line]
+        );
+    }
+
+    fn bytes_contain(frame: &[u8], needle: &[u8]) -> bool {
+        frame.windows(needle.len()).any(|window| window == needle)
+    }
+
+    #[test]
+    fn line_scroll_moves_the_screen_instead_of_repainting() {
+        let mut app = sectioned_app();
+        app.top = app.headings[2].line + 2;
+
+        // 初回はフル再描画で、sticky の h1 罫線 (━) を含む。
+        let full = app.render_frame().unwrap();
+        assert!(bytes_contain(&full, "━".as_bytes()));
+
+        // 差が縦 1 行のフレームはスクロールコマンド (SU) で画面を再利用し、
+        // sticky を塗り直さない。
+        app.scroll_lines(1);
+        let scrolled = app.render_frame().unwrap();
+        assert!(bytes_contain(&scrolled, b"\x1b[1S"));
+        assert!(!bytes_contain(&scrolled, "━".as_bytes()));
+
+        app.scroll_lines(-1);
+        let back = app.render_frame().unwrap();
+        assert!(bytes_contain(&back, b"\x1b[1T"));
+    }
+
+    #[test]
+    fn content_change_forces_a_full_repaint() {
+        let mut app = sectioned_app();
+        app.top = app.headings[2].line + 2;
+        let _ = app.render_frame().unwrap();
+
+        let source = format!("{}extra\n", app.source);
+        assert!(app.replace_source(source));
+        app.scroll_lines(1);
+
+        let frame = app.render_frame().unwrap();
+        assert!(!bytes_contain(&frame, b"\x1b[1S"));
+        assert!(bytes_contain(&frame, "━".as_bytes()));
+    }
+
+    #[test]
+    fn sticky_transition_forces_a_full_repaint() {
+        let mut app = sectioned_app();
+        let d = app.headings[3].line;
+        app.top = d - 6;
+        let _ = app.render_frame().unwrap();
+
+        // このスクロールで sticky が [A, B, C] から [A, D] に変わる。
+        app.scroll_lines(4);
+        let frame = app.render_frame().unwrap();
+        assert!(!bytes_contain(&frame, b"\x1b[4S"));
+        assert!(bytes_contain(&frame, "━".as_bytes()));
+    }
+
+    #[test]
+    fn sticky_never_vanishes_while_scrolling_through_sections() {
+        // 見出しが 1 つでも上へ消えていれば、そこは必ずどこかのセクションの
+        // 中なので、どのスクロール位置でもヘッダは表示され続ける。
+        let mut app = sectioned_app();
+        let first_heading = app.headings[0].line;
+
+        for top in 0..=app.max_top() {
+            app.top = top;
+            assert_eq!(
+                app.sticky_heading_lines().is_empty(),
+                top <= first_heading,
+                "top={top}"
+            );
+        }
+    }
+
+    #[test]
+    fn sticky_is_disabled_while_a_diff_layer_is_shown() {
+        let mut app = sectioned_app();
+        app.top = app.headings[1].line + 2;
+        assert!(!app.sticky_heading_lines().is_empty());
+
+        app.handle_key(press(KeyCode::Char('s')));
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.diff_view, DiffView::New);
+        assert!(app.sticky_heading_lines().is_empty());
+    }
+
+    #[test]
+    fn page_scroll_shrinks_by_the_sticky_overlay_height() {
+        let mut app = sectioned_app();
+        let start = app.headings[2].line + 2;
+        app.top = start;
+        assert_eq!(app.sticky_height(), 7);
+
+        app.handle_key(press(KeyCode::PageDown));
+        assert_eq!(app.top, start + app.body_height() as usize - 7);
+    }
+
+    #[test]
+    fn short_terminal_keeps_only_the_deepest_sticky_headings() {
+        let mut app = sectioned_app();
+        let headings = app.headings.clone();
+        app.top = headings[1].line + 2;
+
+        // body 9 行 → 許容 4 行 → 見出し 1 個 (3 行) だけ。浅い h1 が落ちる。
+        app.height = 10;
+        assert_eq!(app.sticky_heading_lines(), vec![headings[1].line]);
+
+        // 見出し 1 個ぶんも許容できない高さでは sticky ごと出さない。
+        app.height = 5;
+        assert!(app.sticky_heading_lines().is_empty());
     }
 
     #[test]
