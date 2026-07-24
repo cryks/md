@@ -40,7 +40,7 @@ pub(crate) fn render_inline_with_base(text: &str, base_style: TextStyle) -> Styl
         if let Some(end) = rest.strip_prefix("**").and_then(|tail| tail.find("**")) {
             let content_end = index + 2 + end;
             line.push("**", TextStyle::marker());
-            line.push(&text[index + 2..content_end], TextStyle::heading());
+            line.push(&text[index + 2..content_end], TextStyle::strong());
             line.push("**", TextStyle::marker());
             index = content_end + 2;
             continue;

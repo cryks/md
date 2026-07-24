@@ -4,7 +4,7 @@ use syntect::{easy::HighlightLines, parsing::SyntaxSet};
 
 use crate::{
     inline::render_inline,
-    style::{StyledLine, TextStyle, wrap_lines},
+    style::{StyledLine, TextStyle, display_width, wrap_lines},
     table,
 };
 
@@ -61,6 +61,12 @@ impl MarkdownRenderer {
                 output.extend(table::render_table(&lines[index..end], self.width));
                 index = end;
                 continue;
+            }
+
+            if let Some((level, _)) = heading_at(lines[index])
+                && level <= 2
+            {
+                pad_section_gap(&mut output);
             }
 
             output.extend(wrap_lines(
@@ -205,10 +211,30 @@ impl MarkdownRenderer {
             return StyledLine::empty();
         }
 
-        if let Some(heading) = heading_prefix(line) {
+        if let Some((level, prefix)) = heading_at(line) {
             let mut output = StyledLine::empty();
-            output.push(&line[..heading], TextStyle::marker());
-            output.push(&line[heading..], TextStyle::heading());
+            output.push(&line[..prefix], TextStyle::marker());
+            output.push(line[prefix..].trim_end(), TextStyle::heading(level));
+
+            // 見出しの右に罫線を伸ばし、届く位置と太さでレベルの段差を作る:
+            // h1 は画面幅までの太線、h2 は画面幅までの細線、h3 は画面幅の
+            // 半分までの細線、h4 以下はなし。罫線の右端が揃うので、テキスト
+            // 長に関係なくレベルを見比べられる。目標位置までに余白が
+            // 4 セル未満 (区切り空白 1 + 罫線 3 が入らない) のときは
+            // 引かない。折り返し行に罫線が割り込んで崩れるのを避けるため。
+            if level <= 3 {
+                let target = if level <= 2 {
+                    self.width
+                } else {
+                    self.width / 2
+                };
+                let used = display_width(&output.plain_text());
+                if used + 4 <= target {
+                    let glyph = if level == 1 { "━" } else { "─" };
+                    output.push(" ", TextStyle::normal());
+                    output.push(glyph.repeat(target - used - 1), TextStyle::marker());
+                }
+            }
             return output;
         }
 
@@ -249,14 +275,34 @@ fn markdown_options() -> Options {
         | Options::ENABLE_HEADING_ATTRIBUTES
 }
 
-fn heading_prefix(line: &str) -> Option<usize> {
+/// ATX 見出しなら (レベル, テキスト開始 byte 位置) を返す。
+fn heading_at(line: &str) -> Option<(usize, usize)> {
     let trimmed_start = line.len() - line.trim_start().len();
     let trimmed = line.trim_start();
     let count = trimmed.chars().take_while(|ch| *ch == '#').count();
     if (1..=6).contains(&count) && trimmed.as_bytes().get(count) == Some(&b' ') {
-        Some(trimmed_start + count + 1)
+        Some((count, trimmed_start + count + 1))
     } else {
         None
+    }
+}
+
+/// h1/h2 の直前を空行 2 行にそろえる。h3 以下は原文どおり (慣習的に 1 行)
+/// なので、縦の余白の差が大セクションの切れ目になる。原文に既に 2 行以上の
+/// 空行があれば足さない。文書冒頭の見出し (まだ本文が出力されていない) にも
+/// 足さない。
+fn pad_section_gap(output: &mut Vec<StyledLine>) {
+    if !output.iter().any(|line| !line.spans.is_empty()) {
+        return;
+    }
+
+    let trailing_blanks = output
+        .iter()
+        .rev()
+        .take_while(|line| line.spans.is_empty())
+        .count();
+    for _ in trailing_blanks..2 {
+        output.push(StyledLine::empty());
     }
 }
 
@@ -345,6 +391,65 @@ mod tests {
                 .iter()
                 .any(|span| span.text.contains("alpha") && !span.style.bold)
         );
+    }
+
+    #[test]
+    fn h1_and_h2_extend_rule_to_terminal_width() {
+        let lines = render_markdown("# Title\n\ntext\n\n## Section", 40);
+
+        let h1 = &lines[0];
+        assert_eq!(display_width(&h1.plain_text()), 40);
+        assert!(h1.plain_text().ends_with('━'));
+
+        let h2 = lines
+            .iter()
+            .find(|line| line.plain_text().starts_with("## Section"))
+            .unwrap();
+        assert_eq!(display_width(&h2.plain_text()), 40);
+        assert!(h2.plain_text().ends_with('─'));
+    }
+
+    #[test]
+    fn h3_rule_extends_to_half_width() {
+        let lines = render_markdown("### Section", 40);
+
+        assert_eq!(display_width(&lines[0].plain_text()), 20);
+        assert!(lines[0].plain_text().ends_with('─'));
+    }
+
+    #[test]
+    fn h4_has_no_rule() {
+        let lines = render_markdown("#### Section", 40);
+
+        assert_eq!(lines[0].plain_text(), "#### Section");
+    }
+
+    #[test]
+    fn skips_rule_when_heading_leaves_no_room() {
+        // 区切り空白 1 + 罫線 3 セルが入らない幅では罫線を引かない
+        let lines = render_markdown("## abcdef", 12);
+
+        assert!(!lines[0].plain_text().contains('─'));
+    }
+
+    #[test]
+    fn h2_gets_two_blank_lines_before_it() {
+        let texts = render_markdown("body\n\n## Section", 40)
+            .into_iter()
+            .map(|line| line.plain_text())
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts[0], "body");
+        assert!(texts[1].is_empty());
+        assert!(texts[2].is_empty());
+        assert!(texts[3].starts_with("## Section"));
+    }
+
+    #[test]
+    fn leading_heading_gets_no_extra_blank() {
+        let lines = render_markdown("# Title", 40);
+
+        assert!(lines[0].plain_text().starts_with("# Title"));
     }
 
     #[test]

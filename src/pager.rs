@@ -638,7 +638,8 @@ impl App {
     }
 
     fn max_top(&self) -> usize {
-        self.line_count().saturating_sub(self.body_height() as usize)
+        self.line_count()
+            .saturating_sub(self.body_height() as usize)
     }
 
     fn clamp_top(&mut self) {
@@ -677,9 +678,8 @@ impl App {
             return;
         }
 
-        let matched = |(index, text): (usize, String)| {
-            text.to_lowercase().contains(&query).then_some(index)
-        };
+        let matched =
+            |(index, text): (usize, String)| text.to_lowercase().contains(&query).then_some(index);
         let matches = match self.active_layer() {
             Some((rows, _)) => rows
                 .iter()

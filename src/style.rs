@@ -1,6 +1,23 @@
 use crossterm::style::{Attribute, Color};
 use unicode_width::UnicodeWidthChar;
 
+const fn rgb(r: u8, g: u8, b: u8) -> Color {
+    Color::Rgb { r, g, b }
+}
+
+// 配色パレット。Catppuccin Mocha を基にしたパステル調で、ダーク背景の
+// RGB カラー対応端末を前提にする。ANSI 16 色は端末テーマによって
+// 色味が大きくぶれるため使わない。
+const GOLD: Color = rgb(0xFF, 0xC6, 0x6D); // 見出し (h1-h3)・強調
+const LAVENDER: Color = rgb(0xB4, 0xBE, 0xFE); // リストマーカー
+const TEAL: Color = rgb(0x94, 0xE2, 0xD5); // 引用
+const GREEN: Color = rgb(0xA6, 0xE3, 0xA1); // コード
+const BLUE: Color = rgb(0x89, 0xB4, 0xFA); // リンク
+const MAUVE: Color = rgb(0xCB, 0xA6, 0xF7); // テーブルヘッダ
+const ROSE: Color = rgb(0xF3, 0x8B, 0xA8); // エラー
+const GREY: Color = rgb(0x6C, 0x70, 0x86); // 記法マーカー・罫線
+const DARK_GREY: Color = rgb(0x58, 0x5B, 0x70); // テーブル罫線
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TextStyle {
     pub(crate) fg: Option<Color>,
@@ -18,15 +35,29 @@ impl TextStyle {
 
     pub(crate) fn marker() -> Self {
         Self {
-            fg: Some(Color::DarkGrey),
-            dim: true,
+            fg: Some(GREY),
             ..Self::default()
         }
     }
 
-    pub(crate) fn heading() -> Self {
+    /// 見出しスタイル。gold なのは h1-h3 だけで、h4 はデフォルト色 bold、
+    /// h5-h6 はデフォルト色 dim。「色付きの見出しは h3 まで」という段差で、
+    /// bold の有無より確実に深さを見分けられるようにする。h1/h2/h3 の間の
+    /// 区別は罫線の長さと余白が担う (renderer 側)。
+    pub(crate) fn heading(level: usize) -> Self {
         Self {
-            fg: Some(Color::Yellow),
+            fg: (level <= 3).then_some(GOLD),
+            bold: level <= 4,
+            dim: level >= 5,
+            ..Self::default()
+        }
+    }
+
+    /// インライン強調 (`**text**`)。見出しと同じ gold bold にそろえて、
+    /// 画面内の強調色を増やさない。
+    pub(crate) fn strong() -> Self {
+        Self {
+            fg: Some(GOLD),
             bold: true,
             ..Self::default()
         }
@@ -34,21 +65,21 @@ impl TextStyle {
 
     pub(crate) fn quote() -> Self {
         Self {
-            fg: Some(Color::Cyan),
+            fg: Some(TEAL),
             ..Self::default()
         }
     }
 
     pub(crate) fn code() -> Self {
         Self {
-            fg: Some(Color::Green),
+            fg: Some(GREEN),
             ..Self::default()
         }
     }
 
     pub(crate) fn link() -> Self {
         Self {
-            fg: Some(Color::Blue),
+            fg: Some(BLUE),
             underlined: true,
             ..Self::default()
         }
@@ -56,21 +87,21 @@ impl TextStyle {
 
     pub(crate) fn list_marker() -> Self {
         Self {
-            fg: Some(Color::DarkGrey),
+            fg: Some(LAVENDER),
             ..Self::default()
         }
     }
 
     pub(crate) fn table_border() -> Self {
         Self {
-            fg: Some(Color::DarkGrey),
+            fg: Some(DARK_GREY),
             ..Self::default()
         }
     }
 
     pub(crate) fn table_header() -> Self {
         Self {
-            fg: Some(Color::Cyan),
+            fg: Some(MAUVE),
             bold: true,
             ..Self::default()
         }
@@ -78,7 +109,7 @@ impl TextStyle {
 
     pub(crate) fn error() -> Self {
         Self {
-            fg: Some(Color::Red),
+            fg: Some(ROSE),
             bold: true,
             ..Self::default()
         }
@@ -382,7 +413,7 @@ mod tests {
     #[test]
     fn line_bg_replaces_every_span_background() {
         let mut line = StyledLine::styled("a", TextStyle::code());
-        line.push("b", TextStyle::heading());
+        line.push("b", TextStyle::heading(1));
 
         let output = line_with_bg(&line, Color::Blue);
 
@@ -392,7 +423,7 @@ mod tests {
                 .iter()
                 .all(|span| span.style.bg == Some(Color::Blue))
         );
-        assert_eq!(output.spans[1].style.fg, TextStyle::heading().fg);
+        assert_eq!(output.spans[1].style.fg, TextStyle::heading(1).fg);
         assert!(output.spans[1].style.bold);
     }
 }
