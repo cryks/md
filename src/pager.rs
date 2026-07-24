@@ -28,15 +28,36 @@ use crossterm::{
 
 use crate::{
     diff::{self, DiffLayers, DiffRow, RowKind},
-    renderer,
+    renderer, style,
     style::{
-        StyledLine, TextStyle, char_width, display_width, line_with_bg, line_with_bg_ranges,
+        StyledLine, TextStyle, display_width, line_with_bg, line_with_bg_ranges,
         line_with_search_highlight, slice_line,
     },
 };
 
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const WATCH_MAX_SETTLE_TIME: Duration = Duration::from_secs(1);
+
+/// ステータス行の左右ゾーンが接触しない最小の間隔。
+const STATUS_GAP: usize = 2;
+
+/// `?` で開くキー一覧。押すキーではなく用途の近さで並べる。
+const HELP_KEYS: &[(&str, &str)] = &[
+    ("j k ↓ ↑ e y", "Scroll one line"),
+    ("f b PgDn PgUp", "Scroll one page"),
+    ("g G", "Jump to top / bottom"),
+    ("h l ← →", "Scroll 4 columns"),
+    ("H L Shift+← →", "Scroll half a screen width"),
+    ("0", "Back to the first column"),
+    ("/", "Search"),
+    ("n N", "Next / previous match"),
+    ("r", "Reload the file now"),
+    ("w", "Toggle watch mode"),
+    ("s", "Take or discard a snapshot"),
+    ("d", "Cycle diff view"),
+    ("Esc", "Leave diff view"),
+    ("q", "Quit"),
+];
 
 /// Markdown を pager に表示し、終了キーが押されるまで端末セッションを所有する。
 ///
@@ -123,6 +144,8 @@ impl Drop for TerminalSession {
 enum Mode {
     Normal,
     SearchInput(String),
+    /// `?` で開くキー一覧。本文の上へパネルを重ねる間だけ入る。
+    Help,
 }
 
 /// diff 表示の状態。New は現在の内容、Old は snapshot の内容を、どちらも
@@ -257,6 +280,10 @@ impl App {
         self.hint = None;
 
         match &mut self.mode {
+            // 一覧を開いたまま操作を続けられると、どのキーが効いたのか
+            // 画面から読めなくなる。最初の 1 打で必ず閉じ、その打鍵は
+            // 本文へ渡さない。
+            Mode::Help => self.mode = Mode::Normal,
             Mode::SearchInput(input) => match key.code {
                 KeyCode::Esc => {
                     self.mode = Mode::Normal;
@@ -327,6 +354,8 @@ impl App {
                 {
                     self.reload_now();
                 }
+                // `?` は多くの配列で Shift+/ なので、修飾キーは問わない。
+                KeyCode::Char('?') => self.mode = Mode::Help,
                 KeyCode::Esc if self.diff_view != DiffView::Off => {
                     self.set_diff_view(DiffView::Off);
                 }
@@ -445,6 +474,10 @@ impl App {
             }
         }
 
+        if matches!(self.mode, Mode::Help) {
+            self.draw_help(stdout)?;
+        }
+
         self.draw_status(stdout)?;
         stdout.flush()?;
         Ok(())
@@ -452,64 +485,199 @@ impl App {
 
     fn draw_status(&self, stdout: &mut io::Stdout) -> Result<()> {
         let row = self.height.saturating_sub(1);
-        let status = match &self.mode {
-            Mode::SearchInput(input) => format!("/{input}"),
-            Mode::Normal => self.status_text(),
-        };
-        let text = status_line(status, self.width as usize);
+        let bar = line_with_bg(&self.status_line(self.width as usize), self.status_bg());
 
-        queue!(
-            stdout,
-            MoveTo(0, row),
-            SetAttribute(crossterm::style::Attribute::Reverse),
-            Print(text),
-            SetAttribute(crossterm::style::Attribute::Reset),
-            ResetColor
-        )?;
-        Ok(())
+        queue!(stdout, MoveTo(0, row))?;
+        draw_line(stdout, &bar)
     }
 
-    fn status_text(&self) -> String {
+    /// バーの地色。検索入力中と読み込み失敗中だけ色相を変える。失敗表示は
+    /// 次に読めるまで残り続けるので、手元の入力を隠さないよう検索を優先する。
+    fn status_bg(&self) -> Color {
+        if matches!(self.mode, Mode::SearchInput(_)) {
+            style::STATUS_BG_SEARCH
+        } else if self.read_error.is_some() {
+            style::STATUS_BG_ERROR
+        } else {
+            style::STATUS_BG
+        }
+    }
+
+    /// ステータス行を左右 2 ゾーンで組み、間を空白で埋めて `width` ちょうどに
+    /// する。左は「何を見ているか」(ファイル名と状態バッジ)、右は「どこに
+    /// いるか」(行番号と割合)。
+    ///
+    /// 狭い端末では右ゾーンを `?:help` → 行番号 の順に落として割合だけを残し、
+    /// 左ゾーンは幅の 2/3 で頭打ちにする。長いファイル名や長いエラー文で位置
+    /// 表示が押し出されることはなく、収まらなかった左ゾーンは `…` 付きで
+    /// 切れるので、途中までのバッジをそのままの値と読み違えない。
+    fn status_line(&self, width: usize) -> StyledLine {
+        let mut line = truncate_line(&self.status_left(), (width * 2 / 3).max(1));
+        let left_width = display_width(&line.plain_text());
+        let right = self
+            .status_right_forms()
+            .into_iter()
+            .find(|form| left_width + STATUS_GAP + display_width(&form.plain_text()) <= width)
+            .unwrap_or_else(StyledLine::empty);
+
+        let gap = width
+            .saturating_sub(left_width)
+            .saturating_sub(display_width(&right.plain_text()));
+        line.push(" ".repeat(gap), TextStyle::normal());
+        for span in right.spans {
+            line.push(span.text, span.style);
+        }
+        line
+    }
+
+    /// 左ゾーン。ファイル名を主役に置き、以降は既定と違う状態だけをバッジで
+    /// 足す。watch 無効や snapshot 無しは既定なので出さない。
+    fn status_left(&self) -> StyledLine {
+        let mut line = StyledLine::empty();
+        line.push(" ", TextStyle::normal());
+
+        if let Mode::SearchInput(input) = &self.mode {
+            // 端末カーソルは隠したままなので、入力位置は自前の桁で示す。
+            line.push(format!("/{input}"), TextStyle::chrome_strong(style::TEXT));
+            line.push("▏", TextStyle::chrome(style::TEXT));
+            return line;
+        }
+
         let filename = self
             .path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("markdown");
-        let line_count = self.line_count();
-        let percent = ((self.top + self.body_height() as usize).min(line_count) * 100)
-            .checked_div(line_count)
-            .unwrap_or(100);
-        let query = if self.query.is_empty() {
-            String::new()
-        } else {
-            format!("  /{}", self.query)
-        };
-        let column = if self.left == 0 {
-            String::new()
-        } else {
-            format!("  col {}", self.left + 1)
+        line.push(filename, TextStyle::chrome_strong(style::TEXT));
+
+        if self.watch {
+            push_badge(&mut line, "● watch", style::GREEN);
+        }
+        match self.diff_view {
+            // diff 表示中は snapshot があることが前提なので、snap は畳む。
+            // 色は diff 層の色相 (新 = 緑、旧 = 赤) に合わせる。
+            DiffView::New => push_badge(&mut line, "▌diff new", style::GREEN),
+            DiffView::Old => push_badge(&mut line, "▌diff old", style::ROSE),
+            DiffView::Off if self.snapshot.is_some() => {
+                push_badge(&mut line, "◆ snap", style::MAUVE)
+            }
+            DiffView::Off => {}
+        }
+        if self.left > 0 {
+            push_badge(&mut line, &format!("col {}", self.left + 1), style::SUBTEXT);
+        }
+        if !self.query.is_empty() {
+            let (text, color) = self.search_badge();
+            push_badge(&mut line, &text, color);
+        }
+        if let Some(error) = &self.read_error {
+            push_badge(&mut line, &format!("▲ {error}"), style::ROSE);
+        }
+        if let Some(hint) = &self.hint {
+            push_badge(&mut line, hint, style::GOLD);
+        }
+
+        line
+    }
+
+    /// 検索バッジ。ヒット無しだけ色を変えて、空振りが分かるようにする。
+    /// `n`/`N` で現在位置が決まる前は総数だけを出す。
+    fn search_badge(&self) -> (String, Color) {
+        match (self.matches.len(), self.match_index) {
+            (0, _) => (format!("/{} no match", self.query), style::ROSE),
+            (total, Some(index)) => (
+                format!("/{} {}/{total}", self.query, index + 1),
+                style::SUBTEXT,
+            ),
+            (total, None) => (format!("/{} {total}", self.query), style::SUBTEXT),
+        }
+    }
+
+    /// 右ゾーンの候補を広い順に返す。`status_line` が入る最初のものを選ぶ。
+    fn status_right_forms(&self) -> [StyledLine; 3] {
+        let total = self.line_count();
+        let current = (self.top + self.body_height() as usize).min(total);
+        let percent = (current * 100).checked_div(total).unwrap_or(100);
+        // 総行数の桁で右詰めし、スクロール中に右ゾーンの左端を揺らさない。
+        let position = format!("{current:>width$}/{total}", width = total.to_string().len());
+        let percent = format!("{percent:>3}%");
+
+        let form = |help: bool, position_shown: bool| {
+            let mut line = StyledLine::empty();
+            if help {
+                line.push("?:help", TextStyle::chrome(style::GREY));
+                line.push("  ", TextStyle::normal());
+            }
+            if position_shown {
+                line.push(&position, TextStyle::chrome(style::SUBTEXT));
+                line.push("  ", TextStyle::normal());
+            }
+            line.push(&percent, TextStyle::chrome(style::SUBTEXT));
+            line.push(" ", TextStyle::normal());
+            line
         };
 
-        let watch = if self.watch { "watch:on" } else { "watch:off" };
-        let snap = match (self.snapshot.is_some(), self.diff_view) {
-            (false, _) => "",
-            (true, DiffView::Off) => "  snap",
-            (true, DiffView::New) => "  snap diff:new",
-            (true, DiffView::Old) => "  snap diff:old",
-        };
-        let error = match &self.read_error {
-            Some(error) => format!("  error ({error})"),
-            None => String::new(),
-        };
-        let hint = match &self.hint {
-            Some(hint) => format!("  {hint}"),
-            None => String::new(),
-        };
+        [form(true, true), form(false, true), form(false, false)]
+    }
 
-        format!(
-            "{filename}  {percent:>3}%{query}{column}  {watch}{snap}{error}{hint}  \
-             q:quit  /:search  w:watch  s:snap  d:diff  r:reload"
-        )
+    /// キー一覧を本文の上へ中央寄せで重ねる。枠が収まらない端末では何も
+    /// 描かず、ステータス行の `?:help` だけを残す。
+    fn draw_help(&self, stdout: &mut io::Stdout) -> Result<()> {
+        let widest = |widths: &mut dyn Iterator<Item = usize>| widths.max().unwrap_or(0);
+        let key_width = widest(&mut HELP_KEYS.iter().map(|(keys, _)| display_width(keys)));
+        let action_width = widest(&mut HELP_KEYS.iter().map(|(_, action)| display_width(action)));
+        // 左右の余白 2 + 2 と、キー列・説明列の間の 2。
+        let inner_width = key_width + action_width + 6;
+
+        let (Some(free_x), Some(free_y)) = (
+            (self.width as usize).checked_sub(inner_width + 2),
+            (self.body_height() as usize).checked_sub(HELP_KEYS.len() + 2),
+        ) else {
+            return Ok(());
+        };
+        let (x, y) = ((free_x / 2) as u16, (free_y / 2) as u16);
+
+        let border = TextStyle::chrome(style::GREY);
+        let title = " keys ";
+        let mut top = StyledLine::empty();
+        top.push("┌─", border);
+        top.push(title, TextStyle::chrome_strong(style::TEXT));
+        top.push(
+            "─".repeat(inner_width.saturating_sub(1 + display_width(title))),
+            border,
+        );
+        top.push("┐", border);
+
+        let mut bottom = StyledLine::empty();
+        bottom.push("└", border);
+        bottom.push("─".repeat(inner_width), border);
+        bottom.push("┘", border);
+
+        let rows = std::iter::once(top)
+            .chain(HELP_KEYS.iter().map(|(keys, action)| {
+                let mut row = StyledLine::empty();
+                row.push("│", border);
+                row.push("  ", TextStyle::normal());
+                row.push(
+                    format!("{keys:<key_width$}"),
+                    TextStyle::chrome(style::GOLD),
+                );
+                row.push("  ", TextStyle::normal());
+                row.push(
+                    format!("{action:<action_width$}"),
+                    TextStyle::chrome(style::SUBTEXT),
+                );
+                row.push("  ", TextStyle::normal());
+                row.push("│", border);
+                row
+            }))
+            .chain(std::iter::once(bottom));
+
+        for (offset, row) in rows.enumerate() {
+            queue!(stdout, MoveTo(x, y + offset as u16))?;
+            draw_line(stdout, &line_with_bg(&row, style::STATUS_BG))?;
+        }
+        Ok(())
     }
 
     /// watch が有効ならファイルを読み直し、画面に見える状態が変わったかを返す。
@@ -798,20 +966,20 @@ fn apply_style(stdout: &mut io::Stdout, style: TextStyle) -> Result<()> {
     Ok(())
 }
 
-fn status_line(text: String, width: usize) -> String {
-    let mut output = String::new();
-    let mut used = 0usize;
+/// 状態バッジを 1 個ぶん左ゾーンへ足す。太字はファイル名だけに残し、
+/// バッジは色で区別させる。
+fn push_badge(line: &mut StyledLine, text: &str, color: Color) {
+    line.push("  ", TextStyle::normal());
+    line.push(text, TextStyle::chrome(color));
+}
 
-    for ch in text.chars() {
-        let ch_width = char_width(ch);
-        if used + ch_width > width {
-            break;
-        }
-        output.push(ch);
-        used += ch_width;
+/// 表示幅 `max` へ収まるよう末尾を落とし、落とした場合だけ `…` を付ける。
+fn truncate_line(line: &StyledLine, max: usize) -> StyledLine {
+    if display_width(&line.plain_text()) <= max {
+        return line.clone();
     }
-
-    output.push_str(&" ".repeat(width.saturating_sub(used)));
+    let mut output = slice_line(line, 0, max.saturating_sub(1));
+    output.push("…", TextStyle::chrome(style::SUBTEXT));
     output
 }
 
@@ -1031,20 +1199,17 @@ mod tests {
 
         assert!(!app.reload_if_changed());
         assert_eq!(app.source, "in memory");
-        assert!(app.status_text().contains("watch:off"));
-        assert!(app.status_text().contains("w:watch"));
-        assert!(app.status_text().contains("s:snap"));
-        assert!(app.status_text().contains("d:diff"));
-        assert!(app.status_text().contains("r:reload"));
+        assert!(!app.status_line(80).plain_text().contains("● watch"));
 
         app.watch = true;
-        assert!(app.status_text().contains("watch:on"));
+        assert!(app.status_line(80).plain_text().contains("● watch"));
         app.read_error = Some("read failed".to_owned());
         app.pending_source = Some(PendingSource {
             source: "pending".to_owned(),
             first_seen: Instant::now(),
         });
-        assert!(app.status_text().contains("error (read failed)"));
+        assert!(app.status_line(80).plain_text().contains("▲ read failed"));
+        assert_eq!(app.status_bg(), style::STATUS_BG_ERROR);
 
         app.handle_key(press(KeyCode::Char('w')));
         assert!(!app.watch);
@@ -1188,20 +1353,72 @@ mod tests {
 
     #[test]
     fn status_shows_snapshot_and_diff_state() {
-        // キーヘルプにも "s:snap" が常に出るため、状態は watch 表示に続く
-        // セグメントの並びで判定する。
         let mut app = app("content", false);
-        assert!(!app.status_text().contains("watch:off  snap"));
+        assert!(!app.status_line(80).plain_text().contains("snap"));
 
         app.handle_key(press(KeyCode::Char('s')));
-        assert!(app.status_text().contains("watch:off  snap"));
-        assert!(!app.status_text().contains("diff:"));
+        assert!(app.status_line(80).plain_text().contains("◆ snap"));
+
+        // diff 表示中は snapshot があることが前提なので、snap バッジは畳む。
+        app.handle_key(press(KeyCode::Char('d')));
+        let status = app.status_line(80).plain_text();
+        assert!(status.contains("▌diff new"));
+        assert!(!status.contains("◆ snap"));
 
         app.handle_key(press(KeyCode::Char('d')));
-        assert!(app.status_text().contains("snap diff:new"));
+        assert!(app.status_line(80).plain_text().contains("▌diff old"));
+    }
 
-        app.handle_key(press(KeyCode::Char('d')));
-        assert!(app.status_text().contains("snap diff:old"));
+    #[test]
+    fn status_fills_the_width_and_sheds_the_right_zone_when_narrow() {
+        let mut app = app("content", false);
+        app.query = "content".to_owned();
+        app.rebuild_matches();
+
+        let wide = app.status_line(80).plain_text();
+        assert!(wide.contains("?:help"));
+        assert!(wide.contains("/content 1"));
+        assert_eq!(display_width(&wide), 80);
+
+        // 幅が減るごとに ?:help、行番号の順で落ち、割合は最後まで残る。
+        let narrow = app.status_line(30).plain_text();
+        assert!(!narrow.contains("?:help"));
+        assert!(narrow.trim_end().ends_with('%'));
+        assert_eq!(display_width(&narrow), 30);
+
+        let tiny = app.status_line(20).plain_text();
+        assert!(tiny.trim_end().ends_with("100%"));
+        assert_eq!(display_width(&tiny), 20);
+    }
+
+    #[test]
+    fn search_status_reports_a_miss() {
+        let mut app = app("content", false);
+        app.query = "nothing here".to_owned();
+        app.rebuild_matches();
+
+        assert!(
+            app.status_line(80)
+                .plain_text()
+                .contains("/nothing here no match")
+        );
+    }
+
+    #[test]
+    fn help_opens_on_question_mark_and_closes_on_the_next_key() {
+        let mut app = app("content", false);
+
+        app.handle_key(key(
+            KeyCode::Char('?'),
+            KeyEventKind::Press,
+            KeyModifiers::SHIFT,
+        ));
+        assert!(matches!(app.mode, Mode::Help));
+
+        // 閉じるための打鍵は本文へ渡さない。
+        app.handle_key(press(KeyCode::Char('G')));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.top, 0);
     }
 
     #[test]

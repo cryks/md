@@ -8,15 +8,29 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
 // 配色パレット。Catppuccin Mocha を基にしたパステル調で、ダーク背景の
 // RGB カラー対応端末を前提にする。ANSI 16 色は端末テーマによって
 // 色味が大きくぶれるため使わない。
-const GOLD: Color = rgb(0xFF, 0xC6, 0x6D); // 見出し (h1-h3)・強調
+//
+// pub なものは chrome (ステータス行・ヘルプパネル) が状態に応じて色を
+// 選ぶために使う。本文側は下の TextStyle コンストラクタ経由で参照する。
+pub(crate) const GOLD: Color = rgb(0xFF, 0xC6, 0x6D); // 見出し (h1-h3)・強調
 const LAVENDER: Color = rgb(0xB4, 0xBE, 0xFE); // リストマーカー
 const TEAL: Color = rgb(0x94, 0xE2, 0xD5); // 引用
-const GREEN: Color = rgb(0xA6, 0xE3, 0xA1); // コード
+pub(crate) const GREEN: Color = rgb(0xA6, 0xE3, 0xA1); // コード
 const BLUE: Color = rgb(0x89, 0xB4, 0xFA); // リンク
-const MAUVE: Color = rgb(0xCB, 0xA6, 0xF7); // テーブルヘッダ
-const ROSE: Color = rgb(0xF3, 0x8B, 0xA8); // エラー
-const GREY: Color = rgb(0x6C, 0x70, 0x86); // 記法マーカー・罫線
+pub(crate) const MAUVE: Color = rgb(0xCB, 0xA6, 0xF7); // テーブルヘッダ
+pub(crate) const ROSE: Color = rgb(0xF3, 0x8B, 0xA8); // エラー
+pub(crate) const GREY: Color = rgb(0x6C, 0x70, 0x86); // 記法マーカー・罫線
 const DARK_GREY: Color = rgb(0x58, 0x5B, 0x70); // テーブル罫線
+
+pub(crate) const TEXT: Color = rgb(0xCD, 0xD6, 0xF4); // chrome の主テキスト
+pub(crate) const SUBTEXT: Color = rgb(0xA6, 0xAD, 0xC8); // chrome の副次テキスト
+
+// ステータス行の地色。既定は本文の地に近い surface0 で、検索入力中と
+// 読み込み失敗中だけ色相を振る。バーの色そのものが状態を示すので、
+// 文字を読む前にどのモードにいるかが分かる。どれも TEXT / SUBTEXT と
+// アクセント色が乗る前提で、同じ程度の暗さにそろえてある。
+pub(crate) const STATUS_BG: Color = rgb(0x31, 0x32, 0x44);
+pub(crate) const STATUS_BG_SEARCH: Color = rgb(0x2B, 0x3A, 0x54);
+pub(crate) const STATUS_BG_ERROR: Color = rgb(0x4B, 0x27, 0x33);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TextStyle {
@@ -118,6 +132,25 @@ impl TextStyle {
     pub(crate) fn search() -> Self {
         Self {
             reverse: true,
+            bold: true,
+            ..Self::default()
+        }
+    }
+
+    /// chrome (ステータス行・ヘルプパネル) の文字。本文のスタイルと違い、
+    /// 色は呼び出し側が状態に応じて選ぶ。
+    pub(crate) fn chrome(fg: Color) -> Self {
+        Self {
+            fg: Some(fg),
+            ..Self::default()
+        }
+    }
+
+    /// chrome の主役となる文字。ステータス行ではファイル名だけに使い、
+    /// 状態バッジは色だけで区別させて重みを一段落とす。
+    pub(crate) fn chrome_strong(fg: Color) -> Self {
+        Self {
+            fg: Some(fg),
             bold: true,
             ..Self::default()
         }

@@ -66,7 +66,8 @@ fn main() {
   Unicode diagrams via
   [mermaid-text](https://crates.io/crates/mermaid-text).
 - **A real pager** — less-style keys, case-insensitive search with match
-  highlighting, horizontal scrolling.
+  highlighting and a hit counter, horizontal scrolling. The status bar names
+  only the state that differs from the default, and `?` shows the key list.
 - **Live reload** — `--watch` re-reads the file every 250 ms and skips
   half-written intermediate states.
 - **Snapshot diff** — pin the current state, edit the file, and blink
@@ -107,6 +108,7 @@ md --watch notes.md   # open and live-reload on change
 | `s` | Take or discard a snapshot |
 | `d` | Cycle diff view: current ⇄ snapshot |
 | `Esc` | Leave diff view |
+| `?` | Show this list (any key closes it) |
 | `q` | Quit |
 
 ## Snapshot diff
