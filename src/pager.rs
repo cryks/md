@@ -1170,7 +1170,6 @@ impl App {
     /// 時点でいたセクションには印を付ける。帯の外側には空行を置いて、本文と
     /// 地続きに見えないようにする。
     fn draw_section_menu(&self, frame: &mut Vec<u8>, menu: &SectionMenu) -> Result<()> {
-        let headings = self.active_headings();
         let width = self.width as usize;
         let (area_top, height) = self.section_menu_rows(menu);
         if height == 0 {
@@ -1194,40 +1193,107 @@ impl App {
             draw_line(frame, &blank)?;
         }
 
+        let title_width = self.section_menu_title_width(menu);
         for row in 0..height {
-            let index = menu.offset + row;
-            let text = TextStyle {
-                fg: Some(style::TEXT),
-                bg: Some(style::STATUS_BG),
-                reverse: index == menu.selected,
-                ..TextStyle::normal()
-            };
-            let marker = TextStyle {
-                fg: Some(style::GOLD),
-                ..text
-            };
-
-            let mut line = StyledLine::empty();
-            line.push(" ", text);
-            line.push(
-                if menu.current == Some(index) {
-                    "•"
-                } else {
-                    " "
-                },
-                marker,
-            );
-            line.push(" ", text);
-            line.push(&headings[menu.items[index]].text, text);
-
-            let mut visible = slice_line(&line, 0, width);
-            let pad = width.saturating_sub(display_width(&visible.plain_text()));
-            visible.push(" ".repeat(pad), text);
-
             queue!(frame, MoveTo(0, (area_top + row) as u16))?;
-            draw_line(frame, &visible)?;
+            draw_line(
+                frame,
+                &self.section_menu_line(menu, menu.offset + row, title_width),
+            )?;
         }
         Ok(())
+    }
+
+    /// 一覧のタイトル列の幅。窓の外にある項目も含めて決めるので、窓を送っても
+    /// プレビューの桁が動かない。画面の 2/3 を超える見出しはそこで切る。
+    fn section_menu_title_width(&self, menu: &SectionMenu) -> usize {
+        let headings = self.active_headings();
+        menu.items
+            .iter()
+            .map(|index| display_width(&headings[*index].text))
+            .max()
+            .unwrap_or(0)
+            .min(self.width as usize * 2 / 3)
+    }
+
+    /// 一覧の 1 行。見出しのテキストを列幅にそろえ、その右へセクション冒頭の
+    /// プレビューを置く。行末まで地色を敷いて返す。
+    fn section_menu_line(
+        &self,
+        menu: &SectionMenu,
+        index: usize,
+        title_width: usize,
+    ) -> StyledLine {
+        let width = self.width as usize;
+        let selected = index == menu.selected;
+        let text = TextStyle {
+            fg: Some(style::TEXT),
+            bg: Some(style::STATUS_BG),
+            reverse: selected,
+            ..TextStyle::normal()
+        };
+        let marker = TextStyle {
+            fg: Some(style::GOLD),
+            ..text
+        };
+        let preview = TextStyle {
+            // 反転した行で色を落とすと、そこだけ地色が違って見える。
+            fg: Some(if selected {
+                style::TEXT
+            } else {
+                style::SUBTEXT
+            }),
+            ..text
+        };
+
+        let mut line = StyledLine::empty();
+        line.push(" ", text);
+        line.push(
+            if menu.current == Some(index) {
+                "•"
+            } else {
+                " "
+            },
+            marker,
+        );
+        line.push(" ", text);
+
+        let heading = &self.active_headings()[menu.items[index]];
+        let title = slice_line(&StyledLine::styled(&heading.text, text), 0, title_width);
+        let used = display_width(&title.plain_text());
+        for span in title.spans {
+            line.push(span.text, span.style);
+        }
+        line.push(" ".repeat(title_width - used + 2), text);
+        line.push(self.section_preview(menu.items[index]), preview);
+
+        let mut visible = slice_line(&line, 0, width);
+        let pad = width.saturating_sub(display_width(&visible.plain_text()));
+        visible.push(" ".repeat(pad), text);
+        visible
+    }
+
+    /// セクションの冒頭。見出しの次の行から、次の見出しに達するまでの間で
+    /// 最初に中身のある行を返す。中身が無いセクションでは空文字。
+    fn section_preview(&self, index: usize) -> String {
+        let headings = self.active_headings();
+        let total = self.line_count();
+        let start = headings[index].line + 1;
+        let end = headings
+            .get(index + 1)
+            .map_or(total, |next| next.line)
+            .min(total);
+
+        (start..end)
+            .find_map(|line| {
+                let text = match self.active_layer() {
+                    Some((rows, _)) => rows[line].line.plain_text(),
+                    None => self.lines[line].plain_text(),
+                };
+                let text = text.trim().to_owned();
+                (!text.is_empty()).then_some(text)
+            })
+            .unwrap_or_default()
     }
 
     fn draw_status(&self, frame: &mut Vec<u8>) -> Result<()> {
@@ -2814,6 +2880,53 @@ mod tests {
         assert!(app.handle_click(elsewhere));
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.top, origin);
+    }
+
+    #[test]
+    fn previews_show_the_start_of_each_section_in_one_column() {
+        let mut app = app(
+            "# Alpha\n\nfirst body line\n\n# Be\n\nsecond body line\n",
+            false,
+        );
+        app.handle_key(press(KeyCode::Tab));
+        let menu = section_menu(&app);
+        let title_width = app.section_menu_title_width(menu);
+
+        let rows: Vec<String> = (0..menu.items.len())
+            .map(|index| app.section_menu_line(menu, index, title_width).plain_text())
+            .collect();
+
+        // 見出しの幅が違ってもプレビューは同じ桁から始まる。
+        assert_eq!(
+            rows[0].find("first body line"),
+            rows[1].find("second body line")
+        );
+        // 文書の先頭から開いたので現在地の印は付かない。
+        assert!(rows[0].starts_with("   Alpha "), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn the_menu_marks_the_section_you_came_from() {
+        let mut app = outlined_app();
+        app.top = app.headings[index_of(&app.headings, "C")].line + 2;
+        app.handle_key(press(KeyCode::Tab));
+
+        let menu = section_menu(&app);
+        let title_width = app.section_menu_title_width(menu);
+        let marked = app.section_menu_line(menu, 0, title_width).plain_text();
+        let plain = app.section_menu_line(menu, 1, title_width).plain_text();
+
+        assert!(marked.starts_with(" • C"), "{marked:?}");
+        assert!(plain.starts_with("   D"), "{plain:?}");
+    }
+
+    #[test]
+    fn a_preview_skips_blank_lines_and_stops_at_the_next_heading() {
+        let app = app("# Alpha\n\n\n# Be\n\nbody\n", false);
+
+        // Alpha の中身は次の見出しまでに無い。
+        assert_eq!(app.section_preview(0), "");
+        assert_eq!(app.section_preview(1), "body");
     }
 
     #[test]
