@@ -57,6 +57,9 @@ fn main() {
   terminal edge (heavy and light), h3 to half width; gold fades out below h3,
   and h1/h2 get extra vertical padding, so document structure survives fast
   scrolling.
+- **Jump between sections** — `Tab`, or a click on the sticky header, lists the
+  sections beside the one you are reading; moving the selection previews each
+  one before you commit to it.
 - **Tables as tables** — GFM pipe tables become box-drawing grids with column
   alignment and cell wrapping.
 - **Code that looks like code** — fenced blocks are highlighted with
@@ -99,6 +102,8 @@ md --watch notes.md   # open and live-reload on change
 | Wheel | Scroll three lines |
 | `f` / `b`, `PgDn` / `PgUp` | Scroll one page |
 | `g` / `G` | Jump to top / bottom |
+| `Tab` / `Shift`+`Tab` | Open the section menu at the deepest / top level |
+| Click a heading | Open the section menu for that heading |
 | `h` / `l`, `←` / `→` | Scroll 4 columns |
 | `H` / `L`, `Shift`+`←` / `→` | Scroll half a screen width |
 | `0` | Back to the first column |
@@ -114,6 +119,18 @@ md --watch notes.md   # open and live-reload on change
 
 The pager holds the mouse while it runs, so selecting text with the pointer
 needs `Shift` (`Option` in macOS Terminal.app and iTerm2).
+
+## Section menu
+
+`Tab` lists the siblings of the heading at the bottom of the sticky header —
+the sections next to the one you are reading. `Shift`+`Tab` starts at the top
+level instead, and once the list is open both keys walk the chain of levels.
+Clicking a heading opens the list for it, in the sticky header or in the body.
+
+`↑` `↓` (or `k` `j`) move the selection and scroll the body to that section as
+you go, so you can read a section before choosing it. `Enter` keeps the
+position, `Esc` returns to where you opened the list, and a dot marks the
+section you came from. Other keys do nothing while the list is open.
 
 ## Snapshot diff
 

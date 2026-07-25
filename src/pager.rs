@@ -8,6 +8,7 @@
 //! 変更 range は `diff` モジュールが計算し、この層は色と描画だけを持つ。
 
 use std::{
+    cmp::Ordering,
     fs,
     io::{self, Write},
     path::PathBuf,
@@ -19,7 +20,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute, queue,
     style::{Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
@@ -47,6 +48,10 @@ const WATCH_MAX_SETTLE_TIME: Duration = Duration::from_secs(1);
 /// ホイール 1 ノッチのスクロール量。
 const WHEEL_SCROLL_LINES: isize = 3;
 
+/// セクション一覧に一度に出す項目数の上限。sticky の下に残る高さがこれより
+/// 狭い端末では、そちらに合わせて縮める。
+const SECTION_MENU_HEIGHT: usize = 10;
+
 /// ステータス行の左右ゾーンが接触しない最小の間隔。
 const STATUS_GAP: usize = 2;
 
@@ -55,6 +60,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("j k ↓ ↑ e y", "Scroll one line"),
     ("f b PgDn PgUp", "Scroll one page"),
     ("g G", "Jump to top / bottom"),
+    ("Tab Shift+Tab", "Open the section menu"),
     ("h l ← →", "Scroll 4 columns"),
     ("H L Shift+← →", "Scroll half a screen width"),
     ("0", "Back to the first column"),
@@ -167,6 +173,29 @@ enum Mode {
     SearchInput(String),
     /// `?` で開くキー一覧。本文の上へパネルを重ねる間だけ入る。
     Help,
+    /// sticky から開くセクション一覧。
+    Section(SectionMenu),
+}
+
+/// セクション一覧の状態。`anchor` は開いた時点の見出しチェーン
+/// (`App::active_headings` の index、浅い順) で、`depth` はそのうち何段目を
+/// 対象にしているかを指す。sticky は `anchor[..depth]` と選択中の見出しで
+/// 描くので、選択や階層を変えても領域の高さは動かない。
+#[derive(Debug)]
+struct SectionMenu {
+    /// 一覧を開いた時点の `top`。`Esc` はここへ戻す。
+    origin_top: usize,
+    anchor: Vec<usize>,
+    depth: usize,
+    /// 対象と同じ親を持つ同レベルの見出し。対象自身を必ず含み、h1 のように
+    /// 親が無いレベルでは文書内の全 h1 になる。
+    items: Vec<usize>,
+    /// 選択中の `items` index。開いた直後を除き、本文はこの見出しの位置へ
+    /// 寄せてある。
+    selected: usize,
+    /// `origin_top` が属していたセクションの `items` index。文書の先頭など
+    /// どのセクションにも入っていない位置や、別の枝を選んだ後は None。
+    current: Option<usize>,
 }
 
 /// diff 表示の状態。New は現在の内容、Old は snapshot の内容を、どちらも
@@ -339,10 +368,11 @@ impl App {
         self.hint = None;
 
         match &mut self.mode {
-            // 一覧を開いたまま操作を続けられると、どのキーが効いたのか
+            // キー一覧を開いたまま操作を続けられると、どのキーが効いたのか
             // 画面から読めなくなる。最初の 1 打で必ず閉じ、その打鍵は
             // 本文へ渡さない。
             Mode::Help => self.mode = Mode::Normal,
+            Mode::Section(_) => self.handle_section_key(key),
             Mode::SearchInput(input) => match key.code {
                 KeyCode::Esc => {
                     self.mode = Mode::Normal;
@@ -384,6 +414,8 @@ impl App {
                 KeyCode::Char('l') | KeyCode::Right => self.scroll_columns(4),
                 KeyCode::Char('H') => self.scroll_columns(-(self.large_column_scroll() as isize)),
                 KeyCode::Char('L') => self.scroll_columns(self.large_column_scroll() as isize),
+                KeyCode::Tab => self.open_section_menu_from_sticky(false),
+                KeyCode::BackTab => self.open_section_menu_from_sticky(true),
                 KeyCode::Char('/') => self.mode = Mode::SearchInput(String::new()),
                 KeyCode::Char('n') => self.next_match(),
                 KeyCode::Char('N') => self.previous_match(),
@@ -425,19 +457,192 @@ impl App {
         false
     }
 
+    /// セクション一覧が開いている間のキー操作。割り当てのないキーは捨てる:
+    /// 一覧は能動的に開いた状態なので、打ち間違いで閉じて位置を失わせない。
+    fn handle_section_key(&mut self, key: KeyEvent) {
+        let Mode::Section(menu) = &self.mode else {
+            return;
+        };
+        let origin_top = menu.origin_top;
+
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.top = origin_top;
+            }
+            KeyCode::Enter => self.mode = Mode::Normal,
+            KeyCode::Down | KeyCode::Char('j') => self.step_section_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.step_section_selection(-1),
+            KeyCode::Tab => self.step_section_level(1),
+            KeyCode::BackTab => self.step_section_level(-1),
+            _ => {}
+        }
+    }
+
+    /// sticky のチェーンからセクション一覧を開く。`shallowest` が true なら
+    /// 一番浅い段、false なら一番深い段を対象にする。sticky が空になるのは
+    /// 最初の見出しより上にいるときで、そこでは文書の最初の見出しを対象に
+    /// して兄弟を並べる。
+    fn open_section_menu_from_sticky(&mut self, shallowest: bool) {
+        if self.active_headings().is_empty() {
+            return;
+        }
+
+        let chain = sticky_chain(self.active_headings(), self.top, self.max_sticky_count());
+        let target = if shallowest {
+            chain.first().copied()
+        } else {
+            chain.last().copied()
+        };
+        self.open_section_menu(target.unwrap_or(0));
+    }
+
+    /// `target` (`active_headings` の index) のセクション一覧を開く。すでに
+    /// 開いている場合は対象だけ差し替え、`origin_top` は最初に開いたときの
+    /// ものを保つ。
+    ///
+    /// 本文はここでは動かさない。開いた時点の選択は今いるセクションなので、
+    /// 寄せてしまうと Tab を押しただけで画面が飛ぶ。
+    fn open_section_menu(&mut self, target: usize) {
+        let origin_top = match &self.mode {
+            Mode::Section(menu) => menu.origin_top,
+            _ => self.top,
+        };
+        let mut anchor = ancestors(self.active_headings(), target);
+        anchor.push(target);
+        // sticky に載らない浅い段は落とす。通常の sticky と同じ規則で深い方を
+        // 残す。対象自身は必ず要るので、載らない高さでも 1 段は保つ。
+        anchor.drain(..anchor.len().saturating_sub(self.max_sticky_count().max(1)));
+        let depth = anchor.len() - 1;
+
+        self.mode = Mode::Section(SectionMenu {
+            origin_top,
+            anchor,
+            depth,
+            items: Vec::new(),
+            selected: 0,
+            current: None,
+        });
+        self.rebuild_section_items(depth, target, origin_top);
+    }
+
+    /// `anchor` の `depth` 段目にある `target` を対象として一覧を作り直す。
+    fn rebuild_section_items(&mut self, depth: usize, target: usize, origin_top: usize) {
+        let headings = self.active_headings();
+        let items = siblings(headings, target);
+        let selected = items.iter().position(|index| *index == target).unwrap_or(0);
+        // 今いるセクションの印は開いた位置から引く。対象を別の枝へ移した
+        // 後はその枝が一覧に入らないので None になる。
+        let chain = sticky_chain(headings, origin_top, usize::MAX);
+        let current = items.iter().position(|index| chain.contains(index));
+
+        if let Mode::Section(menu) = &mut self.mode {
+            menu.depth = depth;
+            menu.items = items;
+            menu.selected = selected;
+            menu.current = current;
+        }
+    }
+
+    /// 対象の段を深い方 (`delta` > 0) か浅い方へ動かす。段は循環する。
+    fn step_section_level(&mut self, delta: isize) {
+        let Mode::Section(menu) = &self.mode else {
+            return;
+        };
+        let levels = menu.anchor.len();
+        if levels <= 1 {
+            return;
+        }
+        let depth = (menu.depth + levels).saturating_add_signed(delta) % levels;
+        let (target, origin_top) = (menu.anchor[depth], menu.origin_top);
+
+        self.rebuild_section_items(depth, target, origin_top);
+        self.follow_section_selection();
+    }
+
+    /// 選択を 1 つ送る。端では巻き戻す: 止めると末尾から先頭へ戻るのに
+    /// 一覧の長さぶんの打鍵が要る。
+    fn step_section_selection(&mut self, delta: isize) {
+        let Mode::Section(menu) = &mut self.mode else {
+            return;
+        };
+        let len = menu.items.len();
+        menu.selected = (menu.selected + len).saturating_add_signed(delta) % len;
+        self.follow_section_selection();
+    }
+
+    /// 一覧の `index` を選び、その場で確定する。
+    fn select_section_item(&mut self, index: usize) {
+        if let Mode::Section(menu) = &mut self.mode {
+            menu.selected = index;
+        }
+        self.follow_section_selection();
+        self.mode = Mode::Normal;
+    }
+
+    /// 選択中の見出しが sticky の最下段に載り、その直後の行が本文領域の
+    /// 先頭に来るよう `top` を寄せる。一覧を開いている間の sticky は
+    /// `depth + 1` 段で固定なので、その高さのぶんだけ見出しより上に置く。
+    fn follow_section_selection(&mut self) {
+        let Mode::Section(menu) = &self.mode else {
+            return;
+        };
+        let (target, slots) = (menu.items[menu.selected], menu.depth + 1);
+        let line = self.active_headings()[target].line;
+        self.top = (line + 1).saturating_sub(sticky_area_height(slots));
+        self.clamp_top();
+    }
+
     /// マウス入力を処理し、画面を描き直す必要があるかを返す。
     ///
     /// マウスを掴んでいる間はポインタを動かすだけでもイベントが届く。表示が
     /// 変わらない入力で true を返すと、その都度フレームを組み直すことになる
     /// ので、実際に動いた場合だけ true にする。
     fn handle_mouse(&mut self, event: MouseEvent) -> bool {
-        if !matches!(self.mode, Mode::Normal) {
-            return false;
-        }
-
         match event.kind {
-            MouseEventKind::ScrollDown => self.wheel_scroll(WHEEL_SCROLL_LINES),
-            MouseEventKind::ScrollUp => self.wheel_scroll(-WHEEL_SCROLL_LINES),
+            MouseEventKind::Down(MouseButton::Left) => self.handle_click(event.row as usize),
+            MouseEventKind::ScrollDown if matches!(self.mode, Mode::Normal) => {
+                self.wheel_scroll(WHEEL_SCROLL_LINES)
+            }
+            MouseEventKind::ScrollUp if matches!(self.mode, Mode::Normal) => {
+                self.wheel_scroll(-WHEEL_SCROLL_LINES)
+            }
+            _ => false,
+        }
+    }
+
+    /// 左クリックを処理し、画面を描き直す必要があるかを返す。
+    ///
+    /// 見出しを押すと一覧が開く / 対象が差し替わる。一覧の項目を押すとその
+    /// 場で確定し、それ以外の場所を押すと開く前の位置へ戻して閉じる。
+    fn handle_click(&mut self, row: usize) -> bool {
+        match &self.mode {
+            Mode::Normal => match self.heading_at_row(row) {
+                Some(target) => {
+                    self.open_section_menu(target);
+                    true
+                }
+                None => false,
+            },
+            Mode::Section(menu) => {
+                let area_top = sticky_area_height(menu.depth + 1);
+                let height = self.section_menu_height(menu);
+                let item = row
+                    .checked_sub(area_top)
+                    .filter(|offset| *offset < height)
+                    .map(|offset| menu_offset(menu.selected, menu.items.len(), height) + offset);
+                let origin_top = menu.origin_top;
+
+                match (item, self.heading_at_row(row)) {
+                    (Some(index), _) => self.select_section_item(index),
+                    (None, Some(target)) => self.open_section_menu(target),
+                    (None, None) => {
+                        self.mode = Mode::Normal;
+                        self.top = origin_top;
+                    }
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -557,8 +762,7 @@ impl App {
     fn render_frame(&mut self) -> Result<Vec<u8>> {
         self.clamp_top();
         self.clamp_left();
-        let sticky = self.sticky_heading_lines();
-        let slots = self.sticky_slots();
+        let (sticky, slots) = self.sticky_view();
 
         let mut frame: Vec<u8> = Vec::new();
         queue!(frame, BeginSynchronizedUpdate)?;
@@ -568,8 +772,10 @@ impl App {
             for row in sticky_area_height(slots)..self.body_height() as usize {
                 self.draw_body_row(&mut frame, row)?;
             }
-            if matches!(self.mode, Mode::Help) {
-                self.draw_help(&mut frame)?;
+            match &self.mode {
+                Mode::Help => self.draw_help(&mut frame)?,
+                Mode::Section(menu) => self.draw_section_menu(&mut frame, menu)?,
+                _ => {}
             }
         }
 
@@ -694,6 +900,43 @@ impl App {
             .collect()
     }
 
+    /// いま画面に出ている sticky の見出し行 (行 index) とスロット数。
+    ///
+    /// セクション一覧を開いている間は、対象より深い段を落として最下段を選択中
+    /// の見出しに差し替えたものになる。段数が `depth + 1` で固定されるので、
+    /// 選択や階層を変えても一覧の位置と本文の開始行が動かない。
+    fn sticky_view(&self) -> (Vec<usize>, usize) {
+        let Mode::Section(menu) = &self.mode else {
+            return (self.sticky_heading_lines(), self.sticky_slots());
+        };
+
+        let headings = self.active_headings();
+        let lines = menu.anchor[..menu.depth]
+            .iter()
+            .chain(std::iter::once(&menu.items[menu.selected]))
+            .map(|index| headings[*index].line)
+            .collect();
+        (lines, menu.depth + 1)
+    }
+
+    /// 画面 `row` にある見出し (`active_headings` の index)。
+    ///
+    /// sticky では見出し行とその直上の padding を同じ当たりにする。見出しは
+    /// 1 行しかなく、クリックの的として細すぎるため。最下段の padding は本文
+    /// との境界なのでどの見出しにも寄せない。本文側は見出し行そのものだけを
+    /// 見る。前後の空行はセクションの区切りであってどちらにも属さない。
+    fn heading_at_row(&self, row: usize) -> Option<usize> {
+        let (sticky, slots) = self.sticky_view();
+        let line = if row < sticky_area_height(slots) {
+            *sticky.get(row / 2)?
+        } else {
+            self.top + row
+        };
+        self.active_headings()
+            .iter()
+            .position(|heading| heading.line == line)
+    }
+
     /// sticky に出せる見出しの上限。本文が半分以上隠れる端末では、いま読んで
     /// いる場所に近い深いレベルを優先し、浅い方から削る。
     fn max_sticky_count(&self) -> usize {
@@ -782,6 +1025,59 @@ impl App {
         composed
     }
 
+    /// セクション一覧が使う高さ。
+    fn section_menu_height(&self, menu: &SectionMenu) -> usize {
+        let area_top = sticky_area_height(menu.depth + 1);
+        let available = (self.body_height() as usize).saturating_sub(area_top);
+        SECTION_MENU_HEIGHT.min(menu.items.len()).min(available)
+    }
+
+    /// セクション一覧を sticky の直下へ重ねる。sticky と同じ地色の帯として
+    /// 続け、見出しは `#` と罫線を落としたテキストだけを出す。選択行は反転し、
+    /// 開いた時点でいたセクションには印を付ける。
+    fn draw_section_menu(&self, frame: &mut Vec<u8>, menu: &SectionMenu) -> Result<()> {
+        let headings = self.active_headings();
+        let width = self.width as usize;
+        let area_top = sticky_area_height(menu.depth + 1);
+        let height = self.section_menu_height(menu);
+        let offset = menu_offset(menu.selected, menu.items.len(), height);
+
+        for row in 0..height {
+            let index = offset + row;
+            let text = TextStyle {
+                fg: Some(style::TEXT),
+                bg: Some(style::STATUS_BG),
+                reverse: index == menu.selected,
+                ..TextStyle::normal()
+            };
+            let marker = TextStyle {
+                fg: Some(style::GOLD),
+                ..text
+            };
+
+            let mut line = StyledLine::empty();
+            line.push(" ", text);
+            line.push(
+                if menu.current == Some(index) {
+                    "•"
+                } else {
+                    " "
+                },
+                marker,
+            );
+            line.push(" ", text);
+            line.push(&headings[menu.items[index]].text, text);
+
+            let mut visible = slice_line(&line, 0, width);
+            let pad = width.saturating_sub(display_width(&visible.plain_text()));
+            visible.push(" ".repeat(pad), text);
+
+            queue!(frame, MoveTo(0, (area_top + row) as u16))?;
+            draw_line(frame, &visible)?;
+        }
+        Ok(())
+    }
+
     fn draw_status(&self, frame: &mut Vec<u8>) -> Result<()> {
         let row = self.height.saturating_sub(1);
         let bar = line_with_bg(&self.status_line(self.width as usize), self.status_bg());
@@ -839,6 +1135,16 @@ impl App {
             // 端末カーソルは隠したままなので、入力位置は自前の桁で示す。
             line.push(format!("/{input}"), TextStyle::chrome_strong(style::TEXT));
             line.push("▏", TextStyle::chrome(style::TEXT));
+            return line;
+        }
+
+        if matches!(self.mode, Mode::Section(_)) {
+            // `q` も `?` も効かない間なので、抜け方と階層の変え方を出す。
+            for (key, action) in [("Enter", "go"), ("Esc", "cancel"), ("Tab", "level")] {
+                line.push(key, TextStyle::chrome(style::GOLD));
+                line.push(format!(": {action}"), TextStyle::chrome(style::SUBTEXT));
+                line.push("  ", TextStyle::normal());
+            }
             return line;
         }
 
@@ -1076,6 +1382,10 @@ impl App {
         let doc = renderer::render_markdown(&self.source, self.width as usize);
         self.lines = doc.lines;
         self.headings = doc.headings;
+        // 一覧が持つ見出し index は作り直した行を指さないので閉じる。
+        if matches!(self.mode, Mode::Section(_)) {
+            self.mode = Mode::Normal;
+        }
         self.render_gen += 1;
         self.diff = None;
         if self.diff_view != DiffView::Off {
@@ -1268,13 +1578,64 @@ fn sticky_chain(headings: &[Heading], top: usize, max_count: usize) -> Vec<usize
     }
 }
 
+/// `index` の見出しと同じ親を持つ同レベルの見出しを、文書順に返す。自分自身を
+/// 必ず含む。より浅い見出しに出会うまでが同じ親の範囲で、h1 のように親が無い
+/// レベルでは文書内の全 h1 になる。
+fn siblings(headings: &[Heading], index: usize) -> Vec<usize> {
+    let level = headings[index].level;
+    let mut before = Vec::new();
+    for candidate in (0..index).rev() {
+        match headings[candidate].level.cmp(&level) {
+            Ordering::Less => break,
+            Ordering::Equal => before.push(candidate),
+            Ordering::Greater => {}
+        }
+    }
+
+    before.reverse();
+    let mut items = before;
+    items.push(index);
+    for (candidate, heading) in headings.iter().enumerate().skip(index + 1) {
+        match heading.level.cmp(&level) {
+            Ordering::Less => break,
+            Ordering::Equal => items.push(candidate),
+            Ordering::Greater => {}
+        }
+    }
+    items
+}
+
+/// `index` の見出しの祖先を浅い順に返す。手前へさかのぼりながら、それまでに
+/// 見たどれよりも浅い見出しだけを拾う。
+fn ancestors(headings: &[Heading], index: usize) -> Vec<usize> {
+    let mut chain = Vec::new();
+    let mut level = headings[index].level;
+    for candidate in (0..index).rev() {
+        if headings[candidate].level < level {
+            level = headings[candidate].level;
+            chain.push(candidate);
+        }
+    }
+    chain.reverse();
+    chain
+}
+
+/// `height` 行の窓に一覧を出すときの先頭 index。選択を窓の中央に置き、
+/// 一覧の両端では詰める。
+fn menu_offset(selected: usize, len: usize, height: usize) -> usize {
+    if height >= len {
+        return 0;
+    }
+    selected.saturating_sub(height / 2).min(len - height)
+}
+
 /// 見出しの行 index を `map` (入力行 → 整列後の行) で写した複製を返す。
 fn project_headings(headings: &[Heading], map: &[usize]) -> Vec<Heading> {
     headings
         .iter()
         .map(|heading| Heading {
             line: map[heading.line],
-            ..*heading
+            ..heading.clone()
         })
         .collect()
 }
@@ -2032,5 +2393,277 @@ mod tests {
 
         assert!(!app.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0)));
         assert_eq!(app.top, 0);
+    }
+
+    /// 章をまたいだ兄弟関係を見るための章立て:
+    /// `# A / ## B / ### C / ### D / ## E / # F / ## G`。
+    /// 各セクションの本文は、見出しが sticky へ収まる間隔を作るために置く。
+    fn outlined_app() -> App {
+        let mut source = String::new();
+        for heading in ["# A", "## B", "### C", "### D", "## E", "# F", "## G"] {
+            source.push_str(heading);
+            source.push('\n');
+            source.push_str(&"x\n".repeat(12));
+        }
+        app(&source, false)
+    }
+
+    fn index_of(headings: &[Heading], text: &str) -> usize {
+        headings
+            .iter()
+            .position(|heading| heading.text == text)
+            .unwrap_or_else(|| panic!("no heading named {text}"))
+    }
+
+    /// 開いている一覧に並んでいる見出しのテキスト。
+    fn menu_texts(app: &App) -> Vec<String> {
+        let Mode::Section(menu) = &app.mode else {
+            panic!("the section menu should be open");
+        };
+        let headings = app.active_headings();
+        menu.items
+            .iter()
+            .map(|index| headings[*index].text.clone())
+            .collect()
+    }
+
+    /// 本文領域の先頭に来ている行。
+    fn first_body_line(app: &App) -> usize {
+        let (_, slots) = app.sticky_view();
+        app.top + sticky_area_height(slots)
+    }
+
+    #[test]
+    fn siblings_stay_under_the_same_parent() {
+        let headings = &outlined_app().headings;
+        let texts = |items: Vec<usize>| -> Vec<String> {
+            items
+                .into_iter()
+                .map(|index| headings[index].text.clone())
+                .collect()
+        };
+
+        // ## B の兄弟は同じ # A 配下のものだけで、# F 配下の ## G は入らない。
+        assert_eq!(
+            texts(siblings(headings, index_of(headings, "B"))),
+            ["B", "E"]
+        );
+        assert_eq!(
+            texts(siblings(headings, index_of(headings, "C"))),
+            ["C", "D"]
+        );
+        // h1 には親が無いので文書内の全 h1 が並ぶ。
+        assert_eq!(
+            texts(siblings(headings, index_of(headings, "A"))),
+            ["A", "F"]
+        );
+    }
+
+    #[test]
+    fn tab_opens_the_deepest_level_and_walks_the_chain() {
+        let mut app = outlined_app();
+        app.top = app.headings[index_of(&app.headings, "C")].line + 2;
+
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(menu_texts(&app), ["C", "D"]);
+
+        app.handle_key(press(KeyCode::BackTab));
+        assert_eq!(menu_texts(&app), ["B", "E"]);
+
+        app.handle_key(press(KeyCode::BackTab));
+        assert_eq!(menu_texts(&app), ["A", "F"]);
+
+        // 段は循環する。
+        app.handle_key(press(KeyCode::BackTab));
+        assert_eq!(menu_texts(&app), ["C", "D"]);
+    }
+
+    #[test]
+    fn tab_at_the_top_lists_the_first_level() {
+        let mut app = outlined_app();
+        assert!(app.sticky_heading_lines().is_empty());
+
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(menu_texts(&app), ["A", "F"]);
+
+        let Mode::Section(menu) = &app.mode else {
+            panic!("the section menu should be open");
+        };
+        // まだどのセクションにも入っていないので現在地の印は出ない。
+        assert_eq!(menu.current, None);
+    }
+
+    #[test]
+    fn tab_does_nothing_without_headings() {
+        let mut app = app("just text\n", false);
+
+        app.handle_key(press(KeyCode::Tab));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn selecting_previews_the_section_and_escape_rewinds() {
+        let mut app = outlined_app();
+        app.top = app.headings[index_of(&app.headings, "C")].line + 2;
+        let origin = app.top;
+
+        // 開いた時点の選択は今いるセクションなので、本文は動かさない。
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(app.top, origin);
+
+        app.handle_key(press(KeyCode::Down));
+        let d = app.headings[index_of(&app.headings, "D")].line;
+        assert_eq!(first_body_line(&app), d + 1);
+
+        app.handle_key(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.top, origin);
+    }
+
+    #[test]
+    fn enter_keeps_the_previewed_position() {
+        let mut app = outlined_app();
+        app.top = app.headings[index_of(&app.headings, "C")].line + 2;
+
+        app.handle_key(press(KeyCode::Tab));
+        app.handle_key(press(KeyCode::Down));
+        let previewed = app.top;
+
+        app.handle_key(press(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.top, previewed);
+        // 一覧を閉じても、見出しの直後から本文が始まる位置のままでいる。
+        let d = app.headings[index_of(&app.headings, "D")].line;
+        assert_eq!(first_body_line(&app), d + 1);
+    }
+
+    #[test]
+    fn the_menu_swallows_unbound_keys() {
+        let mut app = outlined_app();
+        app.top = app.headings[index_of(&app.headings, "C")].line + 2;
+        app.handle_key(press(KeyCode::Tab));
+        let top = app.top;
+
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('G'),
+            KeyCode::Char('/'),
+            KeyCode::Char('d'),
+        ] {
+            assert!(!app.handle_key(press(code)));
+            assert!(matches!(app.mode, Mode::Section(_)));
+            assert_eq!(app.top, top);
+        }
+    }
+
+    #[test]
+    fn rebuilding_the_lines_closes_the_menu() {
+        let mut app = outlined_app();
+        app.top = app.headings[index_of(&app.headings, "C")].line + 2;
+        app.handle_key(press(KeyCode::Tab));
+
+        app.resize(70, 24);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn sticky_clicks_hit_the_heading_and_the_padding_above_it() {
+        let mut app = outlined_app();
+        app.top = app.headings[index_of(&app.headings, "C")].line + 2;
+        assert_eq!(app.sticky_heading_lines().len(), 3);
+
+        // row 2 が ## B の直上 padding、row 3 が見出しそのもの。
+        for row in [2, 3] {
+            app.mode = Mode::Normal;
+            assert!(app.handle_click(row), "row={row}");
+            assert_eq!(menu_texts(&app), ["B", "E"], "row={row}");
+        }
+
+        // 本文との境界になる最下段の padding はどの見出しにも寄せない。
+        app.mode = Mode::Normal;
+        assert!(!app.handle_click(6));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn body_headings_are_clickable_too() {
+        let mut app = outlined_app();
+        let e = app.headings[index_of(&app.headings, "E")].line;
+        app.top = e - 12;
+        let row = e - app.top;
+        assert!(row >= sticky_area_height(app.sticky_view().1));
+
+        assert!(app.handle_click(row));
+        assert_eq!(menu_texts(&app), ["B", "E"]);
+    }
+
+    #[test]
+    fn clicking_an_item_confirms_and_clicking_elsewhere_rewinds() {
+        let mut app = outlined_app();
+        app.top = app.headings[index_of(&app.headings, "C")].line + 2;
+        let origin = app.top;
+
+        app.handle_key(press(KeyCode::Tab));
+        // 一覧の 2 行目 = ### D。
+        let area = sticky_area_height(app.sticky_view().1);
+        assert!(app.handle_click(area + 1));
+        assert!(matches!(app.mode, Mode::Normal));
+        let d = app.headings[index_of(&app.headings, "D")].line;
+        assert_eq!(first_body_line(&app), d + 1);
+
+        app.top = origin;
+        app.handle_key(press(KeyCode::Tab));
+        app.handle_key(press(KeyCode::Down));
+        assert_ne!(app.top, origin);
+
+        let elsewhere = (0..app.body_height() as usize)
+            .find(|row| *row > area + 2 && app.heading_at_row(*row).is_none())
+            .unwrap();
+        assert!(app.handle_click(elsewhere));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.top, origin);
+    }
+
+    #[test]
+    fn the_menu_follows_the_shown_diff_layer() {
+        let mut app = outlined_app();
+        app.handle_key(press(KeyCode::Char('s')));
+        app.replace_source(app.source.replace("## E\n", "## E2\n"));
+        app.handle_key(press(KeyCode::Char('d')));
+
+        let c = index_of(app.active_headings(), "C");
+        app.top = app.active_headings()[c].line + 2;
+        app.handle_key(press(KeyCode::Tab));
+        app.handle_key(press(KeyCode::BackTab));
+
+        assert_eq!(menu_texts(&app), ["B", "E2"]);
+    }
+
+    #[test]
+    fn a_short_terminal_keeps_only_the_deepest_menu_level() {
+        let mut app = outlined_app();
+        // body 9 行 → sticky に載せられるのは 1 段だけ。
+        app.height = 10;
+        app.top = app.headings[index_of(&app.headings, "C")].line + 2;
+
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(menu_texts(&app), ["C", "D"]);
+        assert_eq!(app.sticky_view().1, 1);
+
+        // 載せられる段が 1 つしかないので階層は行き来できない。
+        app.handle_key(press(KeyCode::BackTab));
+        assert_eq!(menu_texts(&app), ["C", "D"]);
+    }
+
+    #[test]
+    fn the_menu_window_keeps_the_selection_visible() {
+        for selected in 0..10 {
+            let offset = menu_offset(selected, 10, 4);
+            assert!(
+                (offset..offset + 4).contains(&selected),
+                "selected={selected}"
+            );
+            assert!(offset + 4 <= 10, "selected={selected}");
+        }
     }
 }

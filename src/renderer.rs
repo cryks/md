@@ -22,12 +22,15 @@ pub(crate) struct RenderedDoc {
 }
 
 /// `RenderedDoc::lines` 内の見出し 1 個。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Heading {
     /// 見出しの行 index。テキストが長く折り返された場合は先頭行を指す。
     pub(crate) line: usize,
     /// ATX 見出しレベル (1..=3)。
     pub(crate) level: usize,
+    /// `#` マーカーと右へ伸びる罫線を除いた見出しの文字列。セクション一覧
+    /// のように、行をそのまま出すと罫線が邪魔になる場所で使う。
+    pub(crate) text: String,
 }
 
 struct MarkdownRenderer {
@@ -81,7 +84,7 @@ impl MarkdownRenderer {
                 continue;
             }
 
-            if let Some((level, _)) = heading_at(lines[index]) {
+            if let Some((level, prefix)) = heading_at(lines[index]) {
                 if level <= 2 {
                     pad_section_gap(&mut output);
                 }
@@ -90,6 +93,7 @@ impl MarkdownRenderer {
                     headings.push(Heading {
                         line: output.len(),
                         level,
+                        text: lines[index][prefix..].trim_end().to_owned(),
                     });
                 }
             }
