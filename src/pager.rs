@@ -297,6 +297,9 @@ struct FrameState {
     /// sticky 領域が確保していた見出しスロット数。見出しの数が同じでも、
     /// diff の層の切り替えで空きスロットの数だけが変わることがある。
     sticky_slots: usize,
+    /// 本文の上へパネルや帯を重ねていたか。閉じた直後のフレームは、その跡を
+    /// 消すために全行を塗り直す必要がある。
+    overlay: bool,
 }
 
 struct App {
@@ -682,7 +685,13 @@ impl App {
         if menu.origin_row.is_some() {
             return;
         }
-        self.top = self.section_placement(menu).0;
+
+        // 一覧の帯 (項目 + 下の空行) のぶんだけ余分に上へ置き、選んでいる
+        // セクションの先頭が帯に隠れないようにする。確定すると
+        // `section_placement` の位置へ詰め直すので、そこで本文が帯のぶん上へ動く。
+        let (top, _) = self.section_placement(menu);
+        let rows = self.section_menu_rows(menu).1;
+        self.top = top.saturating_sub(rows + 1);
         self.clamp_top();
     }
 
@@ -911,6 +920,7 @@ impl App {
             query: self.query.clone(),
             sticky,
             sticky_slots: slots,
+            overlay: matches!(self.mode, Mode::Help | Mode::Section(_)),
         });
         Ok(frame)
     }
@@ -930,6 +940,8 @@ impl App {
             return Ok(false);
         };
         if !matches!(self.mode, Mode::Normal)
+            // 重ねた行はスクロールしても消えず、そのまま画面に残る。
+            || last.overlay
             || last.render_gen != self.render_gen
             || last.left != self.left
             || last.width != self.width
@@ -1280,7 +1292,10 @@ impl App {
             line.push(span.text, span.style);
         }
         line.push(" ".repeat(title_width - used + 2), text);
-        line.push(self.section_preview(menu.items[index]), preview);
+        // 先頭の余白 1 + 印 1 + 余白 1 + タイトル列 + 区切り 2 の残りが
+        // プレビューに使える幅。
+        let budget = width.saturating_sub(title_width + 5);
+        line.push(self.section_preview(menu.items[index], budget), preview);
 
         let mut visible = slice_line(&line, 0, width);
         let pad = width.saturating_sub(display_width(&visible.plain_text()));
@@ -1288,27 +1303,54 @@ impl App {
         visible
     }
 
-    /// セクションの冒頭。見出しの次の行から、次の見出しに達するまでの間で
-    /// 最初に中身のある行を返す。中身が無いセクションでは空文字。
-    fn section_preview(&self, index: usize) -> String {
+    /// セクションの冒頭を `budget` 桁ぶん。見出しの次の行から、同じかそれより
+    /// 浅い見出しに達するまでの本文を空白でつないで返す。
+    ///
+    /// 直下がすぐサブセクションの見出しであることは多く、そこで打ち切ると
+    /// プレビューが空になる。配下のサブセクションの中身まで続けて拾い、途中の
+    /// 見出し行そのものは飛ばす。切り詰めは呼び出し側の列幅で行うので、ここでは
+    /// `budget` に届いた時点で読むのをやめるだけ。
+    fn section_preview(&self, index: usize, budget: usize) -> String {
+        if budget == 0 {
+            return String::new();
+        }
+
         let headings = self.active_headings();
+        let level = headings[index].level;
         let total = self.line_count();
         let start = headings[index].line + 1;
-        let end = headings
-            .get(index + 1)
+        let end = headings[index + 1..]
+            .iter()
+            .find(|next| next.level <= level)
             .map_or(total, |next| next.line)
             .min(total);
 
-        (start..end)
-            .find_map(|line| {
-                let text = match self.active_layer() {
-                    Some((rows, _)) => rows[line].line.plain_text(),
-                    None => self.lines[line].plain_text(),
-                };
-                let text = text.trim().to_owned();
-                (!text.is_empty()).then_some(text)
-            })
-            .unwrap_or_default()
+        let mut preview = String::new();
+        for line in start..end {
+            // 見出し行は飛ばす。右へ伸びる罫線が付いているので、つなぐと帯が
+            // 罫線で埋まる。
+            if headings.iter().any(|heading| heading.line == line) {
+                continue;
+            }
+
+            let text = match self.active_layer() {
+                Some((rows, _)) => rows[line].line.plain_text(),
+                None => self.lines[line].plain_text(),
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+
+            if !preview.is_empty() {
+                preview.push(' ');
+            }
+            preview.push_str(text);
+            if display_width(&preview) >= budget {
+                break;
+            }
+        }
+        preview
     }
 
     fn draw_status(&self, frame: &mut Vec<u8>) -> Result<()> {
@@ -2489,6 +2531,26 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_menu_repaints_instead_of_scrolling() {
+        let mut app = outlined_app();
+        app.top = app.headings[index_of(&app.headings, "C")].line + 2;
+        app.handle_key(press(KeyCode::Tab));
+        app.handle_key(press(KeyCode::Down));
+        let _ = app.render_frame().unwrap();
+
+        // 確定で本文が帯のぶん上へ動くが、帯の跡はスクロールでは消えない。
+        let (_, rows) = app.section_menu_rows(section_menu(&app));
+        app.handle_key(press(KeyCode::Enter));
+        let frame = app.render_frame().unwrap();
+
+        assert!(!bytes_contain(
+            &frame,
+            format!("\x1b[{}S", rows + 1).as_bytes()
+        ));
+        assert!(bytes_contain(&frame, "━".as_bytes()));
+    }
+
+    #[test]
     fn sticky_never_vanishes_while_scrolling_through_sections() {
         // 見出しが 1 つでも上へ消えていれば、そこは必ずどこかのセクションの
         // 中なので、どのスクロール位置でもヘッダは表示され続ける。
@@ -2750,7 +2812,9 @@ mod tests {
 
         app.handle_key(press(KeyCode::Down));
         let d = app.headings[index_of(&app.headings, "D")].line;
-        assert_eq!(first_body_line(&app), d + 1);
+        // 選んだセクションの先頭は一覧の帯に隠れず、その下から見える。
+        let (first, rows) = app.section_menu_rows(section_menu(&app));
+        assert_eq!(app.top + first + rows + 1, d + 1);
 
         app.handle_key(press(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Normal));
@@ -2758,18 +2822,19 @@ mod tests {
     }
 
     #[test]
-    fn enter_keeps_the_previewed_position() {
+    fn enter_pulls_the_body_up_into_where_the_menu_was() {
         let mut app = outlined_app();
         app.top = app.headings[index_of(&app.headings, "C")].line + 2;
 
         app.handle_key(press(KeyCode::Tab));
         app.handle_key(press(KeyCode::Down));
+        let (_, rows) = app.section_menu_rows(section_menu(&app));
         let previewed = app.top;
 
         app.handle_key(press(KeyCode::Enter));
         assert!(matches!(app.mode, Mode::Normal));
-        assert_eq!(app.top, previewed);
-        // 一覧を閉じても、見出しの直後から本文が始まる位置のままでいる。
+        // 帯が消えたぶん本文が上へ詰まり、見出しの直後が sticky の直下に来る。
+        assert_eq!(app.top, previewed + rows + 1);
         let d = app.headings[index_of(&app.headings, "D")].line;
         assert_eq!(first_body_line(&app), d + 1);
     }
@@ -2936,12 +3001,25 @@ mod tests {
     }
 
     #[test]
-    fn a_preview_skips_blank_lines_and_stops_at_the_next_heading() {
-        let app = app("# Alpha\n\n\n# Be\n\nbody\n", false);
+    fn a_preview_runs_across_lines_and_into_subsections() {
+        let app = app(
+            "# Alpha\n\nfirst\nsecond\n\n## Sub\n\nthird\n\n# Be\n\nbody\n",
+            false,
+        );
 
-        // Alpha の中身は次の見出しまでに無い。
-        assert_eq!(app.section_preview(0), "");
-        assert_eq!(app.section_preview(1), "body");
+        // Alpha の範囲は次の h1 まで。サブセクションの中身も続けてつなぎ、
+        // 途中の見出し行そのものは入らない。
+        assert_eq!(app.section_preview(0, 80), "first second third");
+        assert_eq!(app.section_preview(1, 80), "third");
+        assert_eq!(app.section_preview(2, 80), "body");
+    }
+
+    #[test]
+    fn a_preview_is_empty_when_the_section_has_no_text() {
+        let app = app("# Alpha\n\n## Sub\n\n# Be\n\nbody\n", false);
+
+        assert_eq!(app.section_preview(0, 80), "");
+        assert_eq!(app.section_preview(2, 80), "body");
     }
 
     #[test]
@@ -2982,7 +3060,7 @@ mod tests {
             app.mode = Mode::Normal;
             app.top = 0;
             app.open_section_menu(index, None);
-            app.follow_section_selection();
+            app.confirm_section();
 
             let line = app.headings[index].line;
             let text = app.headings[index].text.clone();
@@ -2994,10 +3072,6 @@ mod tests {
             } else {
                 line
             };
-            assert_eq!(first_body_line(&app), expected, "menu open at {text}");
-
-            // 一覧を閉じても sticky の段数は変わらないので、本文の先頭も動かない。
-            app.mode = Mode::Normal;
             assert_eq!(first_body_line(&app), expected, "confirmed at {text}");
         }
     }
