@@ -17,6 +17,12 @@ use crate::style::StyledLine;
 pub(crate) struct DiffLayers {
     pub(crate) old_rows: Vec<DiffRow>,
     pub(crate) new_rows: Vec<DiffRow>,
+    /// 入力の行 index を整列後の行 index へ写す表。`old_map[i]` は
+    /// `old_lines[i]` が `old_rows` の何番目に置かれたかで、長さは入力の
+    /// 行数と一致する。見出し位置のように入力側の行を指す情報を、Filler で
+    /// ずれた整列後の画面位置へ持ち込むために使う。
+    pub(crate) old_map: Vec<usize>,
+    pub(crate) new_map: Vec<usize>,
 }
 
 pub(crate) struct DiffRow {
@@ -47,6 +53,8 @@ pub(crate) fn compute(old_lines: &[StyledLine], new_lines: &[StyledLine]) -> Dif
     let mut layers = DiffLayers {
         old_rows: Vec::new(),
         new_rows: Vec::new(),
+        old_map: Vec::new(),
+        new_map: Vec::new(),
     };
 
     for operation in operations {
@@ -57,7 +65,7 @@ pub(crate) fn compute(old_lines: &[StyledLine], new_lines: &[StyledLine]) -> Dif
                 len,
             } => {
                 for offset in 0..len {
-                    layers.push(
+                    layers.push_pair(
                         DiffRow {
                             line: old_lines[old_index + offset].clone(),
                             kind: RowKind::Common,
@@ -89,7 +97,7 @@ pub(crate) fn compute(old_lines: &[StyledLine], new_lines: &[StyledLine]) -> Dif
                         &old_texts[old_index + offset],
                         &new_texts[new_index + offset],
                     );
-                    layers.push(
+                    layers.push_pair(
                         DiffRow {
                             line: old_lines[old_index + offset].clone(),
                             kind: RowKind::Changed {
@@ -119,8 +127,17 @@ impl DiffLayers {
         self.new_rows.push(new);
     }
 
+    /// 両層に元行がある位置。同じ整列後 index を両方の写像へ記録する。
+    fn push_pair(&mut self, old: DiffRow, new: DiffRow) {
+        let row = self.old_rows.len();
+        self.old_map.push(row);
+        self.new_map.push(row);
+        self.push(old, new);
+    }
+
     fn push_removed(&mut self, lines: &[StyledLine]) {
         for line in lines {
+            self.old_map.push(self.old_rows.len());
             self.push(
                 DiffRow {
                     line: line.clone(),
@@ -138,6 +155,7 @@ impl DiffLayers {
 
     fn push_added(&mut self, lines: &[StyledLine]) {
         for line in lines {
+            self.new_map.push(self.new_rows.len());
             self.push(
                 DiffRow {
                     line: StyledLine::empty(),
@@ -307,6 +325,18 @@ mod tests {
         assert_eq!(layers.old_rows[1].line.plain_text(), "b");
         assert_eq!(layers.new_rows[1].line.plain_text(), "");
         assert_eq!(layers.new_rows[3].line.plain_text(), "d");
+    }
+
+    #[test]
+    fn maps_input_lines_onto_the_rows_they_landed_on() {
+        let old = plain(&["a", "b", "c"]);
+        let new = plain(&["a", "c", "d"]);
+
+        let layers = compute(&old, &new);
+
+        // 新側は "b" の位置に filler が入るぶん、"c" 以降が 1 行下がる。
+        assert_eq!(layers.old_map, vec![0, 1, 2]);
+        assert_eq!(layers.new_map, vec![0, 2, 3]);
     }
 
     #[test]

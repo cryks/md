@@ -208,6 +208,15 @@ impl DiffPalette {
     };
 }
 
+/// diff 表示が使う整列結果と、両層の見出し位置。`old_headings` /
+/// `new_headings` の `line` は `DiffLayers` の写像で整列後の行へ移してあり、
+/// 通常表示の `App::headings` と同じ意味 (画面に出る行の index) で扱える。
+struct DiffState {
+    layers: DiffLayers,
+    old_headings: Vec<Heading>,
+    new_headings: Vec<Heading>,
+}
+
 struct PendingSource {
     /// 確定前に読めた最新の内容。連続更新中はポーリングごとに置き換える。
     source: String,
@@ -229,6 +238,9 @@ struct FrameState {
     diff_view: DiffView,
     query: String,
     sticky: Vec<usize>,
+    /// sticky 領域が確保していた見出しスロット数。見出しの数が同じでも、
+    /// diff の層の切り替えで空きスロットの数だけが変わることがある。
+    sticky_slots: usize,
 }
 
 struct App {
@@ -260,7 +272,7 @@ struct App {
     diff_view: DiffView,
     /// snapshot と現在の整列結果。source・snapshot・幅のいずれかが変わると None
     /// へ戻り、次に diff 表示が必要になった時点で作り直す。
-    diff: Option<DiffLayers>,
+    diff: Option<DiffState>,
     /// 次のキー入力まで表示する操作ヒント。snapshot 無しで `d` を押した場合に出す。
     hint: Option<String>,
     /// 描画行の世代。`refresh_render` が進め、`FrameState` との比較だけに使う。
@@ -436,6 +448,9 @@ impl App {
     }
 
     /// snapshot と現在の描画行から整列結果を作る。キャッシュがあれば何もしない。
+    ///
+    /// 見出しは両層とも整列後の行 index へ写して持つ。snapshot 側の見出しは
+    /// ここでしか手に入らない (基準の描画行は保持しない) ので、層と同時に作る。
     fn ensure_diff(&mut self) {
         if self.diff.is_some() {
             return;
@@ -443,8 +458,13 @@ impl App {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        let old_lines = renderer::render_markdown(snapshot, self.width as usize).lines;
-        self.diff = Some(diff::compute(&old_lines, &self.lines));
+        let old_doc = renderer::render_markdown(snapshot, self.width as usize);
+        let layers = diff::compute(&old_doc.lines, &self.lines);
+        self.diff = Some(DiffState {
+            old_headings: project_headings(&old_doc.headings, &layers.old_map),
+            new_headings: project_headings(&self.headings, &layers.new_map),
+            layers,
+        });
     }
 
     /// 描画・検索・スクロールが対象にする層。diff 表示が Off の間は None を
@@ -453,8 +473,18 @@ impl App {
         let diff = self.diff.as_ref()?;
         match self.diff_view {
             DiffView::Off => None,
-            DiffView::New => Some((&diff.new_rows, &DiffPalette::NEW)),
-            DiffView::Old => Some((&diff.old_rows, &DiffPalette::OLD)),
+            DiffView::New => Some((&diff.layers.new_rows, &DiffPalette::NEW)),
+            DiffView::Old => Some((&diff.layers.old_rows, &DiffPalette::OLD)),
+        }
+    }
+
+    /// sticky とセクション移動が対象にする見出し。行 index は常に表示中の
+    /// 行リスト (diff 表示中はその層) に対応する。
+    fn active_headings(&self) -> &[Heading] {
+        match (&self.diff, self.diff_view) {
+            (Some(diff), DiffView::New) => &diff.new_headings,
+            (Some(diff), DiffView::Old) => &diff.old_headings,
+            _ => &self.headings,
         }
     }
 
@@ -486,13 +516,14 @@ impl App {
         self.clamp_top();
         self.clamp_left();
         let sticky = self.sticky_heading_lines();
+        let slots = self.sticky_slots();
 
         let mut frame: Vec<u8> = Vec::new();
         queue!(frame, BeginSynchronizedUpdate)?;
 
-        if !self.scroll_frame(&mut frame, &sticky)? {
-            self.draw_sticky(&mut frame, &sticky)?;
-            for row in sticky_area_height(sticky.len())..self.body_height() as usize {
+        if !self.scroll_frame(&mut frame, &sticky, slots)? {
+            self.draw_sticky(&mut frame, &sticky, slots)?;
+            for row in sticky_area_height(slots)..self.body_height() as usize {
                 self.draw_body_row(&mut frame, row)?;
             }
             if matches!(self.mode, Mode::Help) {
@@ -512,6 +543,7 @@ impl App {
             diff_view: self.diff_view,
             query: self.query.clone(),
             sticky,
+            sticky_slots: slots,
         });
         Ok(frame)
     }
@@ -526,7 +558,7 @@ impl App {
     /// 一致し、移動量が本文領域の高さ未満であること。ヘルプ表示中は
     /// スクロールキー自体が届かない (最初の 1 打で閉じる) ので、パネルを
     /// 消し忘れる経路はない。
-    fn scroll_frame(&self, frame: &mut Vec<u8>, sticky: &[usize]) -> Result<bool> {
+    fn scroll_frame(&self, frame: &mut Vec<u8>, sticky: &[usize], slots: usize) -> Result<bool> {
         let Some(last) = &self.last_frame else {
             return Ok(false);
         };
@@ -538,11 +570,12 @@ impl App {
             || last.diff_view != self.diff_view
             || last.query != self.query
             || last.sticky != sticky
+            || last.sticky_slots != slots
         {
             return Ok(false);
         }
 
-        let area_top = sticky_area_height(sticky.len());
+        let area_top = sticky_area_height(slots);
         let body_height = self.body_height() as usize;
         let area_height = body_height - area_top;
         let delta = self.top as isize - last.top as isize;
@@ -609,64 +642,49 @@ impl App {
         Ok(())
     }
 
-    /// sticky 表示する見出しの行 index を h1 側から返す。diff 表示中は行
-    /// index が層のものになり `headings` と対応しないため、常に空。
-    ///
-    /// チェーンは「境界より上にある h1-h3」をスタックで畳んだもの: 深い
-    /// レベルは、後から同じか浅いレベルの見出しが来た時点でそのセクションが
-    /// 閉じているので落とす。
+    /// sticky 表示する見出しの行 index を h1 側から返す。diff 表示中は表示層
+    /// の見出しになるので、行 index はそのまま画面の行として使える。
     fn sticky_heading_lines(&self) -> Vec<usize> {
-        if self.diff_view != DiffView::Off {
-            return Vec::new();
-        }
+        let headings = self.active_headings();
+        sticky_chain(headings, self.top, self.max_sticky_count())
+            .into_iter()
+            .map(|index| headings[index].line)
+            .collect()
+    }
 
-        // 本文が半分以上隠れる端末では、いま読んでいる場所に近い深い
-        // レベルを優先し、浅い方から削る。
+    /// sticky に出せる見出しの上限。本文が半分以上隠れる端末では、いま読んで
+    /// いる場所に近い深いレベルを優先し、浅い方から削る。
+    fn max_sticky_count(&self) -> usize {
         let budget = self.body_height() as usize / 2;
-        let max_count = budget.saturating_sub(1) / 2;
+        budget.saturating_sub(1) / 2
+    }
 
-        let chain_above = |boundary: usize| {
-            let mut chain: Vec<&Heading> = Vec::new();
-            for heading in &self.headings {
-                if heading.line >= boundary {
-                    break;
-                }
-                while chain.last().is_some_and(|last| last.level >= heading.level) {
-                    chain.pop();
-                }
-                chain.push(heading);
+    /// sticky 領域が確保する見出しスロット数。diff 表示中は両層の多い方に
+    /// そろえる: 見出しを増減した文書では層ごとにチェーンの長さが変わり、
+    /// 揃えないと本文の開始行がずれてブリンク比較で無関係な行まで動く。
+    fn sticky_slots(&self) -> usize {
+        let max_count = self.max_sticky_count();
+        let count = |headings: &[Heading]| sticky_chain(headings, self.top, max_count).len();
+        match (&self.diff, self.diff_view) {
+            (Some(diff), DiffView::New | DiffView::Old) => {
+                count(&diff.old_headings).max(count(&diff.new_headings))
             }
-            chain.drain(..chain.len().saturating_sub(max_count));
-            chain
-        };
-
-        // 画面上端を境界にした基本チェーン。この領域に覆われる範囲には
-        // 次セクションの見出しが入りうる。本文が見え始めているのに前の
-        // セクションを出し続けないよう、境界を覆われる範囲の下端まで
-        // 一度だけ広げて計算し直す。広げた結果が自身の領域からはみ出す
-        // (= まだ見えている見出し行と二重表示になる) 場合は基本チェーンへ
-        // 戻す。境界を動的に追い続けると領域の伸縮でチェーンが振動して
-        // 定まらないことがあるため、拡張は一度で打ち切る。
-        let baseline = chain_above(self.top);
-        let candidate = chain_above(self.top + sticky_area_height(baseline.len()));
-        let extent = self.top + sticky_area_height(candidate.len());
-        let chain = if candidate.iter().all(|heading| heading.line < extent) {
-            candidate
-        } else {
-            baseline
-        };
-        chain.into_iter().map(|heading| heading.line).collect()
+            _ => count(self.active_headings()),
+        }
     }
 
     fn sticky_height(&self) -> usize {
-        sticky_area_height(self.sticky_heading_lines().len())
+        sticky_area_height(self.sticky_slots())
     }
 
     /// 見出しチェーンを本文の上へ重ねる。行を覆う overlay なのでスクロール
     /// 位置の解釈は変えず、覆われた行は上へ抜ける前に必ず一度は非覆域を
     /// 通る (ページ送りだけ `scroll_pages` が送り量で補正する)。
-    fn draw_sticky(&self, frame: &mut Vec<u8>, indexes: &[usize]) -> Result<()> {
-        if indexes.is_empty() {
+    ///
+    /// 領域は `slots` 個の見出しぶんを確保し、`indexes` が足りない分は空行に
+    /// する。diff の両層で見出しの数が違っても本文の開始行が動かない。
+    fn draw_sticky(&self, frame: &mut Vec<u8>, indexes: &[usize], slots: usize) -> Result<()> {
+        if slots == 0 {
             return Ok(());
         }
 
@@ -686,27 +704,40 @@ impl App {
         draw_line(frame, &blank)?;
         row += 1;
 
-        for &line_index in indexes {
-            let highlighted = line_with_search_highlight(&self.lines[line_index], &self.query);
-            let visible = slice_line(&highlighted, self.left, width);
-            let mut composed = line_with_bg(&visible, style::STATUS_BG);
-            let pad = width.saturating_sub(display_width(&composed.plain_text()));
-            composed.push(
-                " ".repeat(pad),
-                TextStyle {
-                    bg: Some(style::STATUS_BG),
-                    ..TextStyle::normal()
-                },
-            );
-
+        for slot in 0..slots {
             queue!(frame, MoveTo(0, row))?;
-            draw_line(frame, &composed)?;
+            match indexes.get(slot) {
+                Some(&line_index) => draw_line(frame, &self.sticky_line(line_index))?,
+                None => draw_line(frame, &blank)?,
+            }
             row += 1;
             queue!(frame, MoveTo(0, row))?;
             draw_line(frame, &blank)?;
             row += 1;
         }
         Ok(())
+    }
+
+    /// sticky に出す見出し 1 行。本文と同じ体裁のまま地色だけ差し替え、
+    /// 行末まで背景を敷いて帯として閉じる。
+    fn sticky_line(&self, line_index: usize) -> StyledLine {
+        let width = self.width as usize;
+        let source = match self.active_layer() {
+            Some((rows, _)) => &rows[line_index].line,
+            None => &self.lines[line_index],
+        };
+        let highlighted = line_with_search_highlight(source, &self.query);
+        let visible = slice_line(&highlighted, self.left, width);
+        let mut composed = line_with_bg(&visible, style::STATUS_BG);
+        let pad = width.saturating_sub(display_width(&composed.plain_text()));
+        composed.push(
+            " ".repeat(pad),
+            TextStyle {
+                bg: Some(style::STATUS_BG),
+                ..TextStyle::normal()
+            },
+        );
+        composed
     }
 
     fn draw_status(&self, frame: &mut Vec<u8>) -> Result<()> {
@@ -1152,6 +1183,58 @@ impl App {
 /// 0 なら領域ごと出さない。
 fn sticky_area_height(count: usize) -> usize {
     if count == 0 { 0 } else { 2 * count + 1 }
+}
+
+/// 画面上端が `top` にあるときの見出しチェーンを `headings` の index で返す。
+///
+/// チェーンは「境界より上にある見出し」をスタックで畳んだもの: 深いレベルは、
+/// 後から同じか浅いレベルの見出しが来た時点でそのセクションが閉じているので
+/// 落とす。`max_count` を超える分は浅い方から削る。
+fn sticky_chain(headings: &[Heading], top: usize, max_count: usize) -> Vec<usize> {
+    let chain_above = |boundary: usize| {
+        let mut chain: Vec<usize> = Vec::new();
+        for (index, heading) in headings.iter().enumerate() {
+            if heading.line >= boundary {
+                break;
+            }
+            while chain
+                .last()
+                .is_some_and(|last| headings[*last].level >= heading.level)
+            {
+                chain.pop();
+            }
+            chain.push(index);
+        }
+        chain.drain(..chain.len().saturating_sub(max_count));
+        chain
+    };
+
+    // 画面上端を境界にした基本チェーン。この領域に覆われる範囲には
+    // 次セクションの見出しが入りうる。本文が見え始めているのに前の
+    // セクションを出し続けないよう、境界を覆われる範囲の下端まで
+    // 一度だけ広げて計算し直す。広げた結果が自身の領域からはみ出す
+    // (= まだ見えている見出し行と二重表示になる) 場合は基本チェーンへ
+    // 戻す。境界を動的に追い続けると領域の伸縮でチェーンが振動して
+    // 定まらないことがあるため、拡張は一度で打ち切る。
+    let baseline = chain_above(top);
+    let candidate = chain_above(top + sticky_area_height(baseline.len()));
+    let extent = top + sticky_area_height(candidate.len());
+    if candidate.iter().all(|index| headings[*index].line < extent) {
+        candidate
+    } else {
+        baseline
+    }
+}
+
+/// 見出しの行 index を `map` (入力行 → 整列後の行) で写した複製を返す。
+fn project_headings(headings: &[Heading], map: &[usize]) -> Vec<Heading> {
+    headings
+        .iter()
+        .map(|heading| Heading {
+            line: map[heading.line],
+            ..*heading
+        })
+        .collect()
 }
 
 /// diff 行へスタイルを重ねる。重ね順は 行 tint → 行内強調 → 検索で、検索が
@@ -1786,16 +1869,50 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sticky_is_disabled_while_a_diff_layer_is_shown() {
-        let mut app = sectioned_app();
-        app.top = app.headings[1].line + 2;
-        assert!(!app.sticky_heading_lines().is_empty());
+    /// sticky に出ている見出しのテキスト。表示中の層から引くので、diff の
+    /// 層を切り替えると内容も切り替わる。
+    fn sticky_texts(app: &App) -> Vec<String> {
+        app.sticky_heading_lines()
+            .into_iter()
+            .map(|line| match app.active_layer() {
+                Some((rows, _)) => rows[line].line.plain_text(),
+                None => app.lines[line].plain_text(),
+            })
+            .collect()
+    }
 
+    #[test]
+    fn sticky_shows_the_headings_of_the_layer_on_screen() {
+        let mut app = sectioned_app();
         app.handle_key(press(KeyCode::Char('s')));
+        app.replace_source(app.source.replace("### C\n", "### C2\n"));
+
         app.handle_key(press(KeyCode::Char('d')));
         assert_eq!(app.diff_view, DiffView::New);
-        assert!(app.sticky_heading_lines().is_empty());
+        app.top = app.active_headings()[2].line + 2;
+        assert!(sticky_texts(&app)[2].starts_with("### C2"));
+
+        // 層は整列済みなので同じ top が旧層の同じ位置を指す。
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.diff_view, DiffView::Old);
+        assert!(sticky_texts(&app)[2].starts_with("### C "));
+    }
+
+    #[test]
+    fn sticky_slots_match_the_taller_diff_layer() {
+        let mut app = sectioned_app();
+        app.handle_key(press(KeyCode::Char('s')));
+        // 新層では ### C が本文になり、チェーンが 1 段浅くなる。
+        app.replace_source(app.source.replace("### C\n", "c\n"));
+
+        app.handle_key(press(KeyCode::Char('d')));
+        app.top = app.diff.as_ref().unwrap().old_headings[2].line + 2;
+        let shown = app.sticky_heading_lines().len();
+        let height = app.sticky_height();
+
+        app.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(app.sticky_heading_lines().len(), shown + 1);
+        assert_eq!(app.sticky_height(), height);
     }
 
     #[test]

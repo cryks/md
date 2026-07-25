@@ -127,6 +127,10 @@ only one layer leaves a colored filler row in the other — so holding down `d`
 blinks exactly the parts that changed while everything else stands still.
 `Esc` returns to the normal view.
 
+The sticky header follows the layer on screen, so a renamed heading blinks with
+the body. Both layers reserve the same header height, so adding or removing a
+heading never shifts the rows under it.
+
 ## Watch mode
 
 Start with `--watch` (or toggle with `w`). The file is re-read every 250 ms:
