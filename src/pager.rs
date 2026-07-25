@@ -580,17 +580,27 @@ impl App {
         self.mode = Mode::Normal;
     }
 
-    /// 選択中の見出しが sticky の最下段に載り、その直後の行が本文領域の
-    /// 先頭に来るよう `top` を寄せる。一覧を開いている間の sticky は
-    /// `depth + 1` 段で固定なので、その高さのぶんだけ見出しより上に置く。
+    /// 選択中の見出しの直後の行が本文領域の先頭に来るよう `top` を寄せる。
     fn follow_section_selection(&mut self) {
         let Mode::Section(menu) = &self.mode else {
             return;
         };
-        let (target, slots) = (menu.items[menu.selected], menu.depth + 1);
-        let line = self.active_headings()[target].line;
-        self.top = (line + 1).saturating_sub(sticky_area_height(slots));
+        self.top = self.section_placement(menu).0;
         self.clamp_top();
+    }
+
+    /// 選択中の見出しを sticky の最下段へ載せるための `top` とスロット数。
+    ///
+    /// 見出しより上に敷ける行が足りない (文書の先頭に近い) ときは段を減らし、
+    /// 1 段も敷けなければ sticky を出さずに見出し行そのものを本文の先頭に
+    ///置く。`top` と段数を一箇所で決めることで、一覧を開いている間は選択を
+    /// 動かしても本文の先頭が常に見出しの直後になる。
+    fn section_placement(&self, menu: &SectionMenu) -> (usize, usize) {
+        let line = self.active_headings()[menu.items[menu.selected]].line;
+        (1..=menu.depth + 1)
+            .rev()
+            .find_map(|slots| Some(((line + 1).checked_sub(sticky_area_height(slots))?, slots)))
+            .unwrap_or((line, 0))
     }
 
     /// マウス入力を処理し、画面を描き直す必要があるかを返す。
@@ -625,7 +635,7 @@ impl App {
                 None => false,
             },
             Mode::Section(menu) => {
-                let area_top = sticky_area_height(menu.depth + 1);
+                let area_top = self.section_menu_top(menu);
                 let height = self.section_menu_height(menu);
                 let item = row
                     .checked_sub(area_top)
@@ -903,20 +913,25 @@ impl App {
     /// いま画面に出ている sticky の見出し行 (行 index) とスロット数。
     ///
     /// セクション一覧を開いている間は、対象より深い段を落として最下段を選択中
-    /// の見出しに差し替えたものになる。段数が `depth + 1` で固定されるので、
-    /// 選択や階層を変えても一覧の位置と本文の開始行が動かない。
+    /// の見出しに差し替えたものになる。段数は選択に依らず `section_placement`
+    /// が決めるので、選択や階層を変えても一覧の位置と本文の開始行が動かない。
     fn sticky_view(&self) -> (Vec<usize>, usize) {
         let Mode::Section(menu) = &self.mode else {
             return (self.sticky_heading_lines(), self.sticky_slots());
         };
 
+        let (_, slots) = self.section_placement(menu);
+        if slots == 0 {
+            return (Vec::new(), 0);
+        }
+
         let headings = self.active_headings();
-        let lines = menu.anchor[..menu.depth]
+        let lines = menu.anchor[menu.depth + 1 - slots..menu.depth]
             .iter()
             .chain(std::iter::once(&menu.items[menu.selected]))
             .map(|index| headings[*index].line)
             .collect();
-        (lines, menu.depth + 1)
+        (lines, slots)
     }
 
     /// 画面 `row` にある見出し (`active_headings` の index)。
@@ -1025,9 +1040,14 @@ impl App {
         composed
     }
 
+    /// セクション一覧の 1 行目が来る画面 row。sticky の直下に続けて描く。
+    fn section_menu_top(&self, menu: &SectionMenu) -> usize {
+        sticky_area_height(self.section_placement(menu).1)
+    }
+
     /// セクション一覧が使う高さ。
     fn section_menu_height(&self, menu: &SectionMenu) -> usize {
-        let area_top = sticky_area_height(menu.depth + 1);
+        let area_top = self.section_menu_top(menu);
         let available = (self.body_height() as usize).saturating_sub(area_top);
         SECTION_MENU_HEIGHT.min(menu.items.len()).min(available)
     }
@@ -1038,7 +1058,7 @@ impl App {
     fn draw_section_menu(&self, frame: &mut Vec<u8>, menu: &SectionMenu) -> Result<()> {
         let headings = self.active_headings();
         let width = self.width as usize;
-        let area_top = sticky_area_height(menu.depth + 1);
+        let area_top = self.section_menu_top(menu);
         let height = self.section_menu_height(menu);
         let offset = menu_offset(menu.selected, menu.items.len(), height);
 
@@ -1568,8 +1588,17 @@ fn sticky_chain(headings: &[Heading], top: usize, max_count: usize) -> Vec<usize
     // (= まだ見えている見出し行と二重表示になる) 場合は基本チェーンへ
     // 戻す。境界を動的に追い続けると領域の伸縮でチェーンが振動して
     // 定まらないことがあるため、拡張は一度で打ち切る。
+    //
+    // 広げ幅は段が 1 つ増えた後の高さで測る。見出しが 1 つ昇格すれば領域も
+    // その分伸びるので、伸びる前の高さで測ると、ちょうど境界にいる見出しを
+    // 取りこぼす。上限に達している場合は増えないので伸ばさない。上に見出しが
+    // 1 つも無い位置では領域そのものが無いので、拡張の起点も作らない。
     let baseline = chain_above(top);
-    let candidate = chain_above(top + sticky_area_height(baseline.len()));
+    let reach = match baseline.len() {
+        0 => 0,
+        shown => (shown + 1).min(max_count),
+    };
+    let candidate = chain_above(top + sticky_area_height(reach));
     let extent = top + sticky_area_height(candidate.len());
     if candidate.iter().all(|index| headings[*index].line < extent) {
         candidate
@@ -2405,6 +2434,8 @@ mod tests {
             source.push('\n');
             source.push_str(&"x\n".repeat(12));
         }
+        // 末尾のセクションでも `max_top` に頭打ちされずに寄せきれる余白。
+        source.push_str(&"x\n".repeat(24));
         app(&source, false)
     }
 
@@ -2653,6 +2684,33 @@ mod tests {
         // 載せられる段が 1 つしかないので階層は行き来できない。
         app.handle_key(press(KeyCode::BackTab));
         assert_eq!(menu_texts(&app), ["C", "D"]);
+    }
+
+    #[test]
+    fn every_section_lands_at_the_top_of_its_body() {
+        let mut app = outlined_app();
+        for index in 0..app.headings.len() {
+            app.mode = Mode::Normal;
+            app.top = 0;
+            app.open_section_menu(index);
+            app.follow_section_selection();
+
+            let line = app.headings[index].line;
+            let text = app.headings[index].text.clone();
+            // 見出しが sticky の最下段に載ったならその直後から、載せる余地が
+            // 無かった (文書の先頭) なら見出しそのものから本文が始まる。
+            let (sticky, _) = app.sticky_view();
+            let expected = if sticky.last() == Some(&line) {
+                line + 1
+            } else {
+                line
+            };
+            assert_eq!(first_body_line(&app), expected, "menu open at {text}");
+
+            // 一覧を閉じても sticky の段数は変わらないので、本文の先頭も動かない。
+            app.mode = Mode::Normal;
+            assert_eq!(first_body_line(&app), expected, "confirmed at {text}");
+        }
     }
 
     #[test]
