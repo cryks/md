@@ -460,16 +460,8 @@ impl App {
     /// セクション一覧が開いている間のキー操作。割り当てのないキーは捨てる:
     /// 一覧は能動的に開いた状態なので、打ち間違いで閉じて位置を失わせない。
     fn handle_section_key(&mut self, key: KeyEvent) {
-        let Mode::Section(menu) = &self.mode else {
-            return;
-        };
-        let origin_top = menu.origin_top;
-
         match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Normal;
-                self.top = origin_top;
-            }
+            KeyCode::Esc => self.cancel_section_menu(),
             KeyCode::Enter => self.mode = Mode::Normal,
             KeyCode::Down | KeyCode::Char('j') => self.step_section_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.step_section_selection(-1),
@@ -571,6 +563,16 @@ impl App {
         self.follow_section_selection();
     }
 
+    /// 一覧を閉じ、開く前の位置へ戻す。
+    fn cancel_section_menu(&mut self) {
+        let Mode::Section(menu) = &self.mode else {
+            return;
+        };
+        let origin_top = menu.origin_top;
+        self.mode = Mode::Normal;
+        self.top = origin_top;
+    }
+
     /// 一覧の `index` を選び、その場で確定する。
     fn select_section_item(&mut self, index: usize) {
         if let Mode::Section(menu) = &mut self.mode {
@@ -641,15 +643,19 @@ impl App {
                     .checked_sub(area_top)
                     .filter(|offset| *offset < height)
                     .map(|offset| menu_offset(menu.selected, menu.items.len(), height) + offset);
-                let origin_top = menu.origin_top;
+                // 一覧を開いた見出しと、いまその位置に出ている選択中の見出し。
+                // 選択を動かすと sticky の最下段が差し替わるので、両方を
+                // 「開いた場所」として扱う。
+                let opened_on = [menu.anchor[menu.depth], menu.items[menu.selected]];
 
                 match (item, self.heading_at_row(row)) {
                     (Some(index), _) => self.select_section_item(index),
-                    (None, Some(target)) => self.open_section_menu(target),
-                    (None, None) => {
-                        self.mode = Mode::Normal;
-                        self.top = origin_top;
+                    // 開いた場所をもう一度押したときはトグルとして閉じる。
+                    (None, Some(target)) if opened_on.contains(&target) => {
+                        self.cancel_section_menu()
                     }
+                    (None, Some(target)) => self.open_section_menu(target),
+                    (None, None) => self.cancel_section_menu(),
                 }
                 true
             }
@@ -2711,6 +2717,28 @@ mod tests {
             app.mode = Mode::Normal;
             assert_eq!(first_body_line(&app), expected, "confirmed at {text}");
         }
+    }
+
+    #[test]
+    fn clicking_the_open_heading_again_closes_the_menu() {
+        let mut app = outlined_app();
+        app.top = app.headings[index_of(&app.headings, "C")].line + 2;
+        let origin = app.top;
+
+        // sticky は [A, B, C] で row 5 が ### C。
+        assert!(app.handle_click(5));
+        assert_eq!(menu_texts(&app), ["C", "D"]);
+        assert!(app.handle_click(5));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.top, origin);
+
+        // 選択を動かして最下段が ### D に差し替わった後も、そこを押せば閉じる。
+        app.handle_click(5);
+        app.handle_key(press(KeyCode::Down));
+        assert_ne!(app.top, origin);
+        assert!(app.handle_click(5));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.top, origin);
     }
 
     #[test]
