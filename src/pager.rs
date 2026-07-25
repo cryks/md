@@ -193,6 +193,11 @@ struct SectionMenu {
     /// 選択中の `items` index。開いた直後を除き、本文はこの見出しの位置へ
     /// 寄せてある。
     selected: usize,
+    /// 表示窓の先頭 `items` index。ホイールで動かし、選択が窓の外へ出たときは
+    /// `keep_selection_in_window` が最小限だけ追いつかせる。窓に入りきらない
+    /// 項目数のときだけ 0 以外になり、`items.len()` から窓の行数を引いた値を
+    /// 超えない。
+    offset: usize,
     /// `origin_top` が属していたセクションの `items` index。文書の先頭など
     /// どのセクションにも入っていない位置や、別の枝を選んだ後は None。
     current: Option<usize>,
@@ -513,6 +518,7 @@ impl App {
             depth,
             items: Vec::new(),
             selected: 0,
+            offset: 0,
             current: None,
         });
         self.rebuild_section_items(depth, target, origin_top);
@@ -532,8 +538,52 @@ impl App {
             menu.depth = depth;
             menu.items = items;
             menu.selected = selected;
+            menu.offset = 0;
             menu.current = current;
         }
+        self.keep_selection_in_window();
+    }
+
+    /// 選択が表示窓から出ていたら、最小限だけ窓を動かして戻す。
+    fn keep_selection_in_window(&mut self) {
+        let Mode::Section(menu) = &self.mode else {
+            return;
+        };
+        let rows = self.section_menu_height(menu);
+        if rows == 0 {
+            return;
+        }
+
+        let Mode::Section(menu) = &mut self.mode else {
+            return;
+        };
+        if menu.selected < menu.offset {
+            menu.offset = menu.selected;
+        } else if menu.selected >= menu.offset + rows {
+            menu.offset = menu.selected + 1 - rows;
+        }
+    }
+
+    /// 一覧の表示窓だけを送り、動いたかを返す。選択は動かさないので本文も
+    /// 動かない。
+    fn scroll_section_menu(&mut self, delta: isize) -> bool {
+        let Mode::Section(menu) = &self.mode else {
+            return false;
+        };
+        let last = menu
+            .items
+            .len()
+            .saturating_sub(self.section_menu_height(menu));
+
+        let Mode::Section(menu) = &mut self.mode else {
+            return false;
+        };
+        let next = menu.offset.saturating_add_signed(delta).min(last);
+        if next == menu.offset {
+            return false;
+        }
+        menu.offset = next;
+        true
     }
 
     /// 対象の段を深い方 (`delta` > 0) か浅い方へ動かす。段は循環する。
@@ -560,6 +610,7 @@ impl App {
         };
         let len = menu.items.len();
         menu.selected = (menu.selected + len).saturating_add_signed(delta) % len;
+        self.keep_selection_in_window();
         self.follow_section_selection();
     }
 
@@ -611,14 +662,18 @@ impl App {
     /// 変わらない入力で true を返すと、その都度フレームを組み直すことになる
     /// ので、実際に動いた場合だけ true にする。
     fn handle_mouse(&mut self, event: MouseEvent) -> bool {
-        match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.handle_click(event.row as usize),
-            MouseEventKind::ScrollDown if matches!(self.mode, Mode::Normal) => {
-                self.wheel_scroll(WHEEL_SCROLL_LINES)
+        let scroll = match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                return self.handle_click(event.row as usize);
             }
-            MouseEventKind::ScrollUp if matches!(self.mode, Mode::Normal) => {
-                self.wheel_scroll(-WHEEL_SCROLL_LINES)
-            }
+            MouseEventKind::ScrollDown => WHEEL_SCROLL_LINES,
+            MouseEventKind::ScrollUp => -WHEEL_SCROLL_LINES,
+            _ => return false,
+        };
+
+        match self.mode {
+            Mode::Normal => self.wheel_scroll(scroll),
+            Mode::Section(_) => self.scroll_section_menu(scroll),
             _ => false,
         }
     }
@@ -642,7 +697,7 @@ impl App {
                 let item = row
                     .checked_sub(area_top)
                     .filter(|offset| *offset < height)
-                    .map(|offset| menu_offset(menu.selected, menu.items.len(), height) + offset);
+                    .map(|offset| menu.offset + offset);
                 // 一覧を開いた見出しと、いまその位置に出ている選択中の見出し。
                 // 選択を動かすと sticky の最下段が差し替わるので、両方を
                 // 「開いた場所」として扱う。
@@ -1066,10 +1121,9 @@ impl App {
         let width = self.width as usize;
         let area_top = self.section_menu_top(menu);
         let height = self.section_menu_height(menu);
-        let offset = menu_offset(menu.selected, menu.items.len(), height);
 
         for row in 0..height {
-            let index = offset + row;
+            let index = menu.offset + row;
             let text = TextStyle {
                 fg: Some(style::TEXT),
                 bg: Some(style::STATUS_BG),
@@ -1653,15 +1707,6 @@ fn ancestors(headings: &[Heading], index: usize) -> Vec<usize> {
     }
     chain.reverse();
     chain
-}
-
-/// `height` 行の窓に一覧を出すときの先頭 index。選択を窓の中央に置き、
-/// 一覧の両端では詰める。
-fn menu_offset(selected: usize, len: usize, height: usize) -> usize {
-    if height >= len {
-        return 0;
-    }
-    selected.saturating_sub(height / 2).min(len - height)
 }
 
 /// 見出しの行 index を `map` (入力行 → 整列後の行) で写した複製を返す。
@@ -2452,13 +2497,18 @@ mod tests {
             .unwrap_or_else(|| panic!("no heading named {text}"))
     }
 
-    /// 開いている一覧に並んでいる見出しのテキスト。
-    fn menu_texts(app: &App) -> Vec<String> {
+    fn section_menu(app: &App) -> &SectionMenu {
         let Mode::Section(menu) = &app.mode else {
             panic!("the section menu should be open");
         };
+        menu
+    }
+
+    /// 開いている一覧に並んでいる見出しのテキスト。
+    fn menu_texts(app: &App) -> Vec<String> {
         let headings = app.active_headings();
-        menu.items
+        section_menu(app)
+            .items
             .iter()
             .map(|index| headings[*index].text.clone())
             .collect()
@@ -2523,11 +2573,8 @@ mod tests {
         app.handle_key(press(KeyCode::Tab));
         assert_eq!(menu_texts(&app), ["A", "F"]);
 
-        let Mode::Section(menu) = &app.mode else {
-            panic!("the section menu should be open");
-        };
         // まだどのセクションにも入っていないので現在地の印は出ない。
-        assert_eq!(menu.current, None);
+        assert_eq!(section_menu(&app).current, None);
     }
 
     #[test]
@@ -2741,15 +2788,55 @@ mod tests {
         assert_eq!(app.top, origin);
     }
 
+    /// 一覧が窓に収まらない章立て。`# Doc` の下に `## S0`..`## S13`。
+    fn long_outline_app() -> App {
+        let mut source = String::from("# Doc\n");
+        source.push_str(&"x\n".repeat(4));
+        for index in 0..14 {
+            source.push_str(&format!("## S{index}\n"));
+            source.push_str(&"x\n".repeat(4));
+        }
+        app(&source, false)
+    }
+
     #[test]
-    fn the_menu_window_keeps_the_selection_visible() {
-        for selected in 0..10 {
-            let offset = menu_offset(selected, 10, 4);
+    fn the_wheel_scrolls_the_menu_window_and_leaves_the_rest_alone() {
+        let mut app = long_outline_app();
+        app.top = app.headings[3].line + 1;
+        app.handle_key(press(KeyCode::Tab));
+        let top = app.top;
+        let selected = section_menu(&app).selected;
+        let rows = app.section_menu_height(section_menu(&app));
+        assert!(rows < section_menu(&app).items.len());
+
+        assert!(app.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0)));
+        assert!(section_menu(&app).offset > 0);
+        // 窓が動くだけで、選択も本文も動かない。
+        assert_eq!(section_menu(&app).selected, selected);
+        assert_eq!(app.top, top);
+
+        // 末尾まで送ったら止まり、描き直しも要求しない。
+        while app.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0)) {}
+        let menu = section_menu(&app);
+        assert_eq!(menu.offset, menu.items.len() - rows);
+    }
+
+    #[test]
+    fn moving_the_selection_pulls_the_window_along() {
+        let mut app = long_outline_app();
+        app.top = app.headings[1].line + 1;
+        app.handle_key(press(KeyCode::Tab));
+        let rows = app.section_menu_height(section_menu(&app));
+
+        for _ in 0..section_menu(&app).items.len() {
+            app.handle_key(press(KeyCode::Down));
+            let menu = section_menu(&app);
             assert!(
-                (offset..offset + 4).contains(&selected),
-                "selected={selected}"
+                (menu.offset..menu.offset + rows).contains(&menu.selected),
+                "selected={} offset={}",
+                menu.selected,
+                menu.offset
             );
-            assert!(offset + 4 <= 10, "selected={selected}");
         }
     }
 }
