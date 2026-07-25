@@ -201,6 +201,10 @@ struct SectionMenu {
     /// `origin_top` が属していたセクションの `items` index。文書の先頭など
     /// どのセクションにも入っていない位置や、別の枝を選んだ後は None。
     current: Option<usize>,
+    /// 本文の見出しから開いた場合の、開いた時点の画面 row。sticky から開いた
+    /// 場合は None。Some の間は一覧がその row に紐づいて動かないので、選択で
+    /// 本文を動かさず、確定して初めて移動する。
+    origin_row: Option<usize>,
 }
 
 /// diff 表示の状態。New は現在の内容、Old は snapshot の内容を、どちらも
@@ -467,7 +471,7 @@ impl App {
     fn handle_section_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.cancel_section_menu(),
-            KeyCode::Enter => self.mode = Mode::Normal,
+            KeyCode::Enter => self.confirm_section(),
             KeyCode::Down | KeyCode::Char('j') => self.step_section_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.step_section_selection(-1),
             KeyCode::Tab => self.step_section_level(1),
@@ -491,16 +495,26 @@ impl App {
         } else {
             chain.last().copied()
         };
-        self.open_section_menu(target.unwrap_or(0));
+        self.open_section_menu(target.unwrap_or(0), None);
+    }
+
+    /// クリックした row から一覧の付き方を決める。sticky の見出しは画面の上に
+    /// 固定された行なので一覧も上に付け、本文の見出しはその場に開く。
+    fn menu_anchor_for(&self, row: usize) -> Option<usize> {
+        let (_, slots) = self.sticky_view();
+        (row >= sticky_area_height(slots)).then_some(row)
     }
 
     /// `target` (`active_headings` の index) のセクション一覧を開く。すでに
     /// 開いている場合は対象だけ差し替え、`origin_top` は最初に開いたときの
     /// ものを保つ。
     ///
+    /// `origin_row` は本文の見出しから開いた場合のその画面 row で、sticky から
+    /// 開いた場合は None。
+    ///
     /// 本文はここでは動かさない。開いた時点の選択は今いるセクションなので、
     /// 寄せてしまうと Tab を押しただけで画面が飛ぶ。
-    fn open_section_menu(&mut self, target: usize) {
+    fn open_section_menu(&mut self, target: usize, origin_row: Option<usize>) {
         let origin_top = match &self.mode {
             Mode::Section(menu) => menu.origin_top,
             _ => self.top,
@@ -520,6 +534,7 @@ impl App {
             selected: 0,
             offset: 0,
             current: None,
+            origin_row,
         });
         self.rebuild_section_items(depth, target, origin_top);
     }
@@ -549,7 +564,7 @@ impl App {
         let Mode::Section(menu) = &self.mode else {
             return;
         };
-        let rows = self.section_menu_height(menu);
+        let rows = self.section_menu_rows(menu).1;
         if rows == 0 {
             return;
         }
@@ -573,7 +588,7 @@ impl App {
         let last = menu
             .items
             .len()
-            .saturating_sub(self.section_menu_height(menu));
+            .saturating_sub(self.section_menu_rows(menu).1);
 
         let Mode::Section(menu) = &mut self.mode else {
             return false;
@@ -629,7 +644,16 @@ impl App {
         if let Mode::Section(menu) = &mut self.mode {
             menu.selected = index;
         }
-        self.follow_section_selection();
+        self.confirm_section();
+    }
+
+    /// 選択中のセクションへ移り、一覧を閉じる。
+    fn confirm_section(&mut self) {
+        let Mode::Section(menu) = &self.mode else {
+            return;
+        };
+        self.top = self.section_placement(menu).0;
+        self.clamp_top();
         self.mode = Mode::Normal;
     }
 
@@ -638,6 +662,11 @@ impl App {
         let Mode::Section(menu) = &self.mode else {
             return;
         };
+        // 本文の見出しから開いた一覧はその row に紐づいて動かない。ここで本文を
+        // 動かすと一覧のすぐ上で見出しが入れ替わり、どこから開いたのかを見失う。
+        if menu.origin_row.is_some() {
+            return;
+        }
         self.top = self.section_placement(menu).0;
         self.clamp_top();
     }
@@ -680,23 +709,24 @@ impl App {
 
     /// 左クリックを処理し、画面を描き直す必要があるかを返す。
     ///
-    /// 見出しを押すと一覧が開く / 対象が差し替わる。一覧の項目を押すとその
-    /// 場で確定し、それ以外の場所を押すと開く前の位置へ戻して閉じる。
+    /// 見出しを押すと一覧が開く / 対象が差し替わる。同じ見出しをもう一度押すと
+    /// 閉じる。一覧の項目を押すとその場で確定し、それ以外の場所を押すと開く前の
+    /// 位置へ戻して閉じる。
     fn handle_click(&mut self, row: usize) -> bool {
         match &self.mode {
             Mode::Normal => match self.heading_at_row(row) {
                 Some(target) => {
-                    self.open_section_menu(target);
+                    let anchor = self.menu_anchor_for(row);
+                    self.open_section_menu(target, anchor);
                     true
                 }
                 None => false,
             },
             Mode::Section(menu) => {
-                let area_top = self.section_menu_top(menu);
-                let height = self.section_menu_height(menu);
+                let (first, count) = self.section_menu_rows(menu);
                 let item = row
-                    .checked_sub(area_top)
-                    .filter(|offset| *offset < height)
+                    .checked_sub(first)
+                    .filter(|offset| *offset < count)
                     .map(|offset| menu.offset + offset);
                 // 一覧を開いた見出しと、いまその位置に出ている選択中の見出し。
                 // 選択を動かすと sticky の最下段が差し替わるので、両方を
@@ -709,7 +739,10 @@ impl App {
                     (None, Some(target)) if opened_on.contains(&target) => {
                         self.cancel_section_menu()
                     }
-                    (None, Some(target)) => self.open_section_menu(target),
+                    (None, Some(target)) => {
+                        let anchor = self.menu_anchor_for(row);
+                        self.open_section_menu(target, anchor);
+                    }
                     (None, None) => self.cancel_section_menu(),
                 }
                 true
@@ -977,8 +1010,10 @@ impl App {
     /// の見出しに差し替えたものになる。段数は選択に依らず `section_placement`
     /// が決めるので、選択や階層を変えても一覧の位置と本文の開始行が動かない。
     fn sticky_view(&self) -> (Vec<usize>, usize) {
-        let Mode::Section(menu) = &self.mode else {
-            return (self.sticky_heading_lines(), self.sticky_slots());
+        // 本文の見出しから開いた一覧では本文が動かないので、sticky も普段どおり。
+        let menu = match &self.mode {
+            Mode::Section(menu) if menu.origin_row.is_none() => menu,
+            _ => return (self.sticky_heading_lines(), self.sticky_slots()),
         };
 
         let (_, slots) = self.section_placement(menu);
@@ -1101,26 +1136,63 @@ impl App {
         composed
     }
 
-    /// セクション一覧の 1 行目が来る画面 row。sticky の直下に続けて描く。
-    fn section_menu_top(&self, menu: &SectionMenu) -> usize {
-        sticky_area_height(self.section_placement(menu).1)
+    /// 一覧の項目が並ぶ先頭 row と行数。
+    ///
+    /// sticky から開いた一覧は sticky の直下に続き、上の空行は sticky の最下段
+    /// が兼ねる。本文の見出しから開いた一覧は、その見出しとの間に空行を 1 行
+    /// 挟んで真下に開き、下端まで届かないときは同じ形で真上へ回す。どちらも
+    /// 本文との間に空行を 1 行残し、帯が本文と地続きに見えないようにする。
+    fn section_menu_rows(&self, menu: &SectionMenu) -> (usize, usize) {
+        let body = self.body_height() as usize;
+        let wanted = SECTION_MENU_HEIGHT.min(menu.items.len());
+
+        let Some(anchor) = menu.origin_row else {
+            let first = sticky_area_height(self.section_placement(menu).1);
+            return (first, wanted.min(body.saturating_sub(first + 1)));
+        };
+
+        let below = anchor + 2;
+        let below_count = wanted.min(body.saturating_sub(below + 1));
+        if below_count == wanted {
+            return (below, below_count);
+        }
+
+        let above_count = wanted.min(anchor.saturating_sub(2));
+        if above_count > below_count {
+            (anchor - 1 - above_count, above_count)
+        } else {
+            (below, below_count)
+        }
     }
 
-    /// セクション一覧が使う高さ。
-    fn section_menu_height(&self, menu: &SectionMenu) -> usize {
-        let area_top = self.section_menu_top(menu);
-        let available = (self.body_height() as usize).saturating_sub(area_top);
-        SECTION_MENU_HEIGHT.min(menu.items.len()).min(available)
-    }
-
-    /// セクション一覧を sticky の直下へ重ねる。sticky と同じ地色の帯として
-    /// 続け、見出しは `#` と罫線を落としたテキストだけを出す。選択行は反転し、
-    /// 開いた時点でいたセクションには印を付ける。
+    /// セクション一覧を本文の上へ重ねる。sticky と同じ地色の帯として描き、
+    /// 見出しは `#` と罫線を落としたテキストだけを出す。選択行は反転し、開いた
+    /// 時点でいたセクションには印を付ける。帯の外側には空行を置いて、本文と
+    /// 地続きに見えないようにする。
     fn draw_section_menu(&self, frame: &mut Vec<u8>, menu: &SectionMenu) -> Result<()> {
         let headings = self.active_headings();
         let width = self.width as usize;
-        let area_top = self.section_menu_top(menu);
-        let height = self.section_menu_height(menu);
+        let (area_top, height) = self.section_menu_rows(menu);
+        if height == 0 {
+            return Ok(());
+        }
+
+        let blank = StyledLine::styled(
+            " ".repeat(width),
+            TextStyle {
+                bg: Some(style::STATUS_BG),
+                ..TextStyle::normal()
+            },
+        );
+        // 上の空行は、sticky から続く場合は sticky の最下段が兼ねている。
+        if menu.origin_row.is_some() {
+            queue!(frame, MoveTo(0, (area_top - 1) as u16))?;
+            draw_line(frame, &blank)?;
+        }
+        if area_top + height < self.body_height() as usize {
+            queue!(frame, MoveTo(0, (area_top + height) as u16))?;
+            draw_line(frame, &blank)?;
+        }
 
         for row in 0..height {
             let index = menu.offset + row;
@@ -2682,6 +2754,42 @@ mod tests {
     }
 
     #[test]
+    fn a_body_heading_opens_the_menu_beside_it() {
+        let mut app = outlined_app();
+        let e = app.headings[index_of(&app.headings, "E")].line;
+        app.top = e - 12;
+        let row = e - app.top;
+        let top = app.top;
+
+        assert!(app.handle_click(row));
+        assert_eq!(menu_texts(&app), ["B", "E"]);
+        // 見出しとの間に空行を 1 行挟んだ真下に開く。
+        assert_eq!(app.section_menu_rows(section_menu(&app)).0, row + 2);
+
+        // 確定するまでは本文も一覧の位置も動かない。
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.top, top);
+        assert_eq!(app.section_menu_rows(section_menu(&app)).0, row + 2);
+
+        app.handle_key(press(KeyCode::Enter));
+        let b = app.headings[index_of(&app.headings, "B")].line;
+        assert_eq!(first_body_line(&app), b + 1);
+    }
+
+    #[test]
+    fn a_popup_with_no_room_below_opens_above() {
+        let mut app = outlined_app();
+        let g = app.headings[index_of(&app.headings, "G")].line;
+        app.top = g - (app.body_height() as usize - 2);
+        let row = g - app.top;
+
+        assert!(app.handle_click(row));
+        let (first, count) = app.section_menu_rows(section_menu(&app));
+        assert!(count > 0);
+        assert!(first + count < row, "first={first} count={count} row={row}");
+    }
+
+    #[test]
     fn clicking_an_item_confirms_and_clicking_elsewhere_rewinds() {
         let mut app = outlined_app();
         app.top = app.headings[index_of(&app.headings, "C")].line + 2;
@@ -2745,7 +2853,7 @@ mod tests {
         for index in 0..app.headings.len() {
             app.mode = Mode::Normal;
             app.top = 0;
-            app.open_section_menu(index);
+            app.open_section_menu(index, None);
             app.follow_section_selection();
 
             let line = app.headings[index].line;
@@ -2806,7 +2914,7 @@ mod tests {
         app.handle_key(press(KeyCode::Tab));
         let top = app.top;
         let selected = section_menu(&app).selected;
-        let rows = app.section_menu_height(section_menu(&app));
+        let rows = app.section_menu_rows(section_menu(&app)).1;
         assert!(rows < section_menu(&app).items.len());
 
         assert!(app.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0)));
@@ -2826,7 +2934,7 @@ mod tests {
         let mut app = long_outline_app();
         app.top = app.headings[1].line + 1;
         app.handle_key(press(KeyCode::Tab));
-        let rows = app.section_menu_height(section_menu(&app));
+        let rows = app.section_menu_rows(section_menu(&app)).1;
 
         for _ in 0..section_menu(&app).items.len() {
             app.handle_key(press(KeyCode::Down));
