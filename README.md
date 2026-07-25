@@ -57,9 +57,8 @@ fn main() {
   terminal edge (heavy and light), h3 to half width; gold fades out below h3,
   and h1/h2 get extra vertical padding, so document structure survives fast
   scrolling.
-- **Jump between sections** — `Tab`, or a click on the sticky header, lists the
-  sections beside the one you are reading; moving the selection previews each
-  one before you commit to it.
+- **Jump between sections** — `Tab`, or a click on any heading, lists the
+  sections beside the one you are reading, each with the first line of its text.
 - **Tables as tables** — GFM pipe tables become box-drawing grids with column
   alignment and cell wrapping.
 - **Code that looks like code** — fenced blocks are highlighted with
@@ -125,12 +124,19 @@ needs `Shift` (`Option` in macOS Terminal.app and iTerm2).
 `Tab` lists the siblings of the heading at the bottom of the sticky header —
 the sections next to the one you are reading. `Shift`+`Tab` starts at the top
 level instead, and once the list is open both keys walk the chain of levels.
-Clicking a heading opens the list for it, in the sticky header or in the body.
+Every entry carries the first line of its section, lined up in its own column.
 
-`↑` `↓` (or `k` `j`) move the selection and scroll the body to that section as
-you go, so you can read a section before choosing it. `Enter` keeps the
-position, `Esc` returns to where you opened the list, and a dot marks the
-section you came from. Other keys do nothing while the list is open.
+`↑` `↓` (or `k` `j`) move the selection, the wheel scrolls the list itself, and
+`Enter` goes to the selected section. `Esc` returns to where you opened the
+list, and a dot marks the section you came from. Other keys do nothing while
+the list is open.
+
+Clicking a heading opens the list for it; clicking that heading again closes
+it. From the sticky header the list hangs underneath, and the body follows the
+selection as you move so you can read a section before choosing it. From a
+heading in the body the list opens right there — under the line, or above it
+when the bottom of the screen is close — and the body holds still until you
+pick an entry.
 
 ## Snapshot diff
 
