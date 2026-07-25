@@ -556,7 +556,22 @@ impl App {
             menu.offset = 0;
             menu.current = current;
         }
-        self.keep_selection_in_window();
+        self.center_selection_in_window();
+    }
+
+    /// 表示窓を、選択ができるだけ窓の中央に来る位置へ置く。一覧の端では詰める
+    /// ので、先頭や末尾のセクションから開いたときは中央にならない。
+    fn center_selection_in_window(&mut self) {
+        let Mode::Section(menu) = &self.mode else {
+            return;
+        };
+        let rows = self.section_menu_rows(menu).1;
+        let last = menu.items.len().saturating_sub(rows);
+
+        let Mode::Section(menu) = &mut self.mode else {
+            return;
+        };
+        menu.offset = menu.selected.saturating_sub(rows / 2).min(last);
     }
 
     /// 選択が表示窓から出ていたら、最小限だけ窓を動かして戻す。
@@ -3018,6 +3033,30 @@ mod tests {
             source.push_str(&"x\n".repeat(4));
         }
         app(&source, false)
+    }
+
+    #[test]
+    fn the_menu_opens_with_the_selection_centered() {
+        let mut app = long_outline_app();
+        // ## S7 の中で開く。前後に同じだけ兄弟が見える位置から始まる。
+        app.top = app.headings[8].line + 1;
+        app.handle_key(press(KeyCode::Tab));
+        let menu = section_menu(&app);
+        let rows = app.section_menu_rows(menu).1;
+        assert_eq!(menu.offset, menu.selected - rows / 2);
+
+        // 一覧の先頭側では詰める。
+        app.mode = Mode::Normal;
+        app.top = app.headings[1].line + 1;
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(section_menu(&app).offset, 0);
+
+        // 末尾側も同じ。
+        app.mode = Mode::Normal;
+        app.top = app.headings[14].line + 1;
+        app.handle_key(press(KeyCode::Tab));
+        let menu = section_menu(&app);
+        assert_eq!(menu.offset, menu.items.len() - rows);
     }
 
     #[test]
