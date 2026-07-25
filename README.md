@@ -2,22 +2,31 @@
 
 <p align="center">
 A Markdown pager for the terminal — syntax highlighting, box-drawn tables,
-Mermaid diagrams as text, live reload, and a blinking snapshot diff.
+Mermaid diagrams as text, sticky headings, live reload, and a blinking snapshot
+diff.
 </p>
 
 <p align="center">
-<img src="assets/demo.svg" alt="md rendering a Markdown document in a terminal" width="780">
+<img src="assets/demo.png" alt="md rendering a Markdown document in a terminal" width="820">
 </p>
 
 <details>
-<summary>The Markdown behind this screen</summary>
+<summary>The Markdown behind the screen above</summary>
 
 ````markdown
-# Redline Release Notes
+---
+title: Redline Release Notes
+version: 0.4.0
+---
 
-A tiny status report, rendered by `md` right in your terminal.
+# Redline 0.4.0
+
+A status report for the ingest service, rendered by `md` right in your terminal.
 
 ## Pipeline
+
+Every push walks the same four stages. A red stage stops the train, and the
+[build log](https://example.com/builds/4821) says which one.
 
 ```mermaid
 graph LR; A[Commit] --> B[Build] --> C[Test] --> D[Ship]
@@ -31,22 +40,6 @@ graph LR; A[Commit] --> B[Build] --> C[Test] --> D[Ship]
 - Snapshot diff: press `d` to blink between before and after
 
 > Ship small, ship often — the release train leaves on time.
-
-### Benchmarks
-
-| scenario | p50 | p99 | verdict |
-| --- | ---: | ---: | :---: |
-| parse 10 MB | 3.2 ms | 7.4 ms | pass |
-| render tree | 0.7 ms | 2.3 ms | pass |
-
-### Example
-
-```rust
-fn main() {
-    let doc = markdown::parse("# hello");
-    println!("{}", doc.render(Width::Terminal));
-}
-```
 ````
 
 </details>
@@ -57,8 +50,11 @@ fn main() {
   terminal edge (heavy and light), h3 to half width; gold fades out below h3,
   and h1/h2 get extra vertical padding, so document structure survives fast
   scrolling.
+- **Headings that stay on screen** — the h1–h3 chain around what you are
+  reading sits above the body, so you always know where you are.
 - **Jump between sections** — `Tab`, or a click on any heading, lists the
-  sections beside the one you are reading, each with the first line of its text.
+  sections beside the one you are reading, each with the start of its text in a
+  second column.
 - **Tables as tables** — GFM pipe tables become box-drawing grids with column
   alignment and cell wrapping.
 - **Code that looks like code** — fenced blocks are highlighted with
@@ -119,17 +115,37 @@ md --watch notes.md   # open and live-reload on change
 The pager holds the mouse while it runs, so selecting text with the pointer
 needs `Shift` (`Option` in macOS Terminal.app and iTerm2).
 
+## Sticky headings
+
+The h1–h3 that contain the top of the screen stay pinned above the body on a
+tinted band. On a terminal short enough that the band would take half the
+height, the shallowest levels are dropped first — the nearest heading is the one
+worth keeping.
+
+Scrolling redraws only the rows that moved, so the pinned headings do not
+flicker as the body slides under them.
+
 ## Section menu
+
+<p align="center">
+<img src="assets/sections.png" alt="The section menu listing sibling sections, each with the start of its text" width="820">
+</p>
 
 `Tab` lists the siblings of the heading at the bottom of the sticky header —
 the sections next to the one you are reading. `Shift`+`Tab` starts at the top
 level instead, and once the list is open both keys walk the chain of levels.
-Every entry carries the first line of its section, lined up in its own column.
 
-`↑` `↓` (or `k` `j`) move the selection, the wheel scrolls the list itself, and
-`Enter` goes to the selected section. `Esc` returns to where you opened the
-list, and a dot marks the section you came from. Other keys do nothing while
-the list is open.
+Every entry carries the start of its section in its own column: the first text
+under the heading, running on through the subsections below it so a section that
+opens with a subheading still shows something. Titles are measured across the
+whole list, including entries outside the window, so paging through does not
+shift the preview column.
+
+The list shows up to ten entries at a time and opens with the selection near the
+middle, so you can see how far the siblings run in each direction. `↑` `↓` (or
+`k` `j`) move the selection, the wheel scrolls the list itself, and `Enter` goes
+to the selected section. `Esc` returns to where you opened the list, and a dot
+marks the section you came from. Other keys do nothing while the list is open.
 
 Clicking a heading opens the list for it; clicking that heading again closes
 it. From the sticky header the list hangs underneath, and the body follows the
@@ -138,10 +154,21 @@ heading in the body the list opens right there — under the line, or above it
 when the bottom of the screen is close — and the body holds still until you
 pick an entry.
 
+## Search
+
+<p align="center">
+<img src="assets/search.png" alt="Search matches highlighted in the body with a hit counter in the status bar" width="820">
+</p>
+
+`/` types a query into the status bar, which changes color while you edit it.
+Matching is case-insensitive and every match on screen is drawn in reverse,
+including matches inside the sticky headings. `n` and `N` walk the hits and the
+status bar keeps the count; a query that matches nothing says so instead.
+
 ## Snapshot diff
 
 <p align="center">
-<img src="assets/diff.svg" alt="Animated diff view blinking between the current file and its snapshot" width="700">
+<img src="assets/diff.png" alt="The diff view blinking between the current file and its snapshot" width="820">
 </p>
 
 Press `s` to pin the current document as the baseline, keep editing the file,
