@@ -96,6 +96,7 @@ md --watch notes.md   # open and live-reload on change
 | Key | Action |
 | --- | --- |
 | `j` / `k`, `↓` / `↑`, `e` / `y` | Scroll one line |
+| Wheel | Scroll three lines |
 | `f` / `b`, `PgDn` / `PgUp` | Scroll one page |
 | `g` / `G` | Jump to top / bottom |
 | `h` / `l`, `←` / `→` | Scroll 4 columns |
@@ -110,6 +111,9 @@ md --watch notes.md   # open and live-reload on change
 | `Esc` | Leave diff view |
 | `?` | Show this list (any key closes it) |
 | `q` | Quit |
+
+The pager holds the mouse while it runs, so selecting text with the pointer
+needs `Shift` (`Option` in macOS Terminal.app and iTerm2).
 
 ## Snapshot diff
 

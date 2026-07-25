@@ -17,7 +17,10 @@ use std::{
 use anyhow::Result;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEvent, MouseEventKind,
+    },
     execute, queue,
     style::{Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{
@@ -40,6 +43,9 @@ use crate::{
 
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const WATCH_MAX_SETTLE_TIME: Duration = Duration::from_secs(1);
+
+/// ホイール 1 ノッチのスクロール量。
+const WHEEL_SCROLL_LINES: isize = 3;
 
 /// ステータス行の左右ゾーンが接触しない最小の間隔。
 const STATUS_GAP: usize = 2;
@@ -89,6 +95,9 @@ pub(crate) fn run(path: PathBuf, source: String, watch: bool) -> Result<()> {
                     }
                     should_draw = true;
                 }
+                Event::Mouse(mouse) => {
+                    should_draw = app.handle_mouse(mouse);
+                }
                 Event::Resize(width, height) => {
                     app.resize(width, height);
                     should_draw = true;
@@ -127,7 +136,10 @@ impl TerminalSession {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, Hide)?;
+        // マウスを掴むと端末側のドラッグ選択とホイール送りが止まる。選択は
+        // Shift (端末によっては Option) 併用で従来どおり使え、ホイールは
+        // `App::handle_mouse` が本文スクロールとして受け直す。
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
         Ok(Self { stdout })
     }
 
@@ -138,7 +150,13 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = execute!(self.stdout, Show, LeaveAlternateScreen, ResetColor);
+        let _ = execute!(
+            self.stdout,
+            Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            ResetColor
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -405,6 +423,30 @@ impl App {
         }
 
         false
+    }
+
+    /// マウス入力を処理し、画面を描き直す必要があるかを返す。
+    ///
+    /// マウスを掴んでいる間はポインタを動かすだけでもイベントが届く。表示が
+    /// 変わらない入力で true を返すと、その都度フレームを組み直すことになる
+    /// ので、実際に動いた場合だけ true にする。
+    fn handle_mouse(&mut self, event: MouseEvent) -> bool {
+        if !matches!(self.mode, Mode::Normal) {
+            return false;
+        }
+
+        match event.kind {
+            MouseEventKind::ScrollDown => self.wheel_scroll(WHEEL_SCROLL_LINES),
+            MouseEventKind::ScrollUp => self.wheel_scroll(-WHEEL_SCROLL_LINES),
+            _ => false,
+        }
+    }
+
+    /// 縦へ `delta` 行スクロールし、位置が動いたかを返す。
+    fn wheel_scroll(&mut self, delta: isize) -> bool {
+        let before = self.top;
+        self.scroll_lines(delta);
+        self.top != before
     }
 
     /// `s` の反転動作。基準が無ければ今表示している内容 (ディスクではない) を
@@ -1958,5 +2000,37 @@ mod tests {
 
         app.handle_key(press(KeyCode::Esc));
         assert_eq!(app.line_count(), app.lines.len());
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_the_body_only_when_the_view_can_move() {
+        let mut app = sectioned_app();
+
+        assert!(app.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0)));
+        assert!(app.top > 0);
+
+        // 末尾では位置が動かないので描き直しも要求しない。ポインタの移動
+        // イベントも同じで、これを true にすると全画面の塗り直しが続く。
+        app.top = app.max_top();
+        assert!(!app.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0)));
+        assert!(!app.handle_mouse(mouse(MouseEventKind::Moved, 4, 4)));
+    }
+
+    #[test]
+    fn wheel_is_ignored_while_a_panel_is_open() {
+        let mut app = sectioned_app();
+        app.handle_key(press(KeyCode::Char('?')));
+
+        assert!(!app.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0)));
+        assert_eq!(app.top, 0);
     }
 }
