@@ -332,7 +332,11 @@ pub(crate) fn slice_line(line: &StyledLine, left: usize, width: usize) -> Styled
             if column >= right {
                 return output;
             }
-            if column >= left && next_column <= right {
+            if column < left {
+                // 左端で半分切れた全角文字は、見えている 1 桁を空白で埋める。
+                // 捨てるだけだと、その行の後ろの文字がすべて 1 桁左へずれる。
+                output.push(" ".repeat(next_column - left), span.style);
+            } else if next_column <= right {
                 output.push(ch.to_string(), span.style);
             }
 
@@ -486,6 +490,13 @@ fn find_match_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_char_cut_by_the_left_edge_leaves_a_blank() {
+        let line = StyledLine::styled("あいう", TextStyle::normal());
+
+        assert_eq!(slice_line(&line, 1, 4).plain_text(), " い");
+    }
 
     #[test]
     fn slices_line_by_display_columns() {
