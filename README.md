@@ -63,6 +63,9 @@ graph LR; A[Commit] --> B[Build] --> C[Test] --> D[Ship]
 - **Mermaid without a browser** — ` ```mermaid ` blocks are rendered as
   Unicode diagrams via
   [mermaid-text](https://crates.io/crates/mermaid-text), in color.
+- **Alerts as blocks** — GitHub alerts (`> [!NOTE]`, `[!TIP]`,
+  `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`) get a bar down their left edge
+  and a bold title, both in the kind's color as on GitHub.
 - **A real pager** — less-style keys, case-insensitive search with match
   highlighting and a hit counter, horizontal scrolling. The status bar names
   only the state that differs from the default, and `?` shows the key list.
@@ -154,13 +157,20 @@ heading in the body the list opens right there — under the line, or above it
 when the bottom of the screen is close — and the body holds still until you
 pick an entry.
 
-## Mermaid colors
+## Mermaid diagrams
 
-Diagrams are drawn in the palette of the page: box-drawing lines and arrowheads
-in blue, bars in teal over a dim track, and labels in the terminal's own text
-color.
+Diagrams are drawn in the palette of the page: lines in blue, arrowheads in
+mauve, and bars in teal over a dim track. Text outside any box, such as edge
+labels and sequence messages, keeps the terminal's own text color.
 
-Flowcharts and state diagrams also take the colors written in the source:
+Each box (a flowchart node, a state, a sequence participant or note) has its
+border and label drawn in one of seven colors. The color follows the label, so
+boxes with the same label share it: a participant has one color at both ends
+of its lifeline. An arrowhead that lands on a box border takes the box's color.
+A box that encloses other boxes, such as a subgraph or the outer ring of a
+double circle, keeps the line color so the boxes inside stay distinct.
+
+Colors written in the source take precedence: in flowcharts and state diagrams,
 `fill`, `stroke` and `color` set through `style`, `classDef` and `linkStyle`.
 Pie slices cycle through twelve colors.
 
@@ -169,6 +179,11 @@ Two adjustments keep source colors readable on a dark background. A light
 about 2:1 contrast against the background is ignored in favor of the palette.
 This catches the `#333` common in examples written for a white page, and pure
 blue as well.
+
+mermaid-text cannot draw the cross (`-x`, `--x`) and open (`-)`, `--)`)
+arrows of sequence diagrams, so they are drawn as plain arrows (`->>`,
+`-->>`). The message keeps its solid or dashed line; only the arrowhead's
+shape is lost.
 
 ## Search
 

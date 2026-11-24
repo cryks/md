@@ -84,6 +84,12 @@ impl MarkdownRenderer {
                 continue;
             }
 
+            if let Some((next, block)) = self.alert_at(&lines, index) {
+                output.extend(block);
+                index = next;
+                continue;
+            }
+
             if let Some((level, prefix)) = heading_at(lines[index]) {
                 if level <= 2 {
                     pad_section_gap(&mut output);
@@ -197,6 +203,41 @@ impl MarkdownRenderer {
         }
 
         Some((next, output))
+    }
+
+    /// 行頭から始まる引用だけを alert とみなす。alert の棒は 0 桁目から引くので、
+    /// リスト項目の中の引用まで alert にすると、リストのインデントが消える。
+    fn alert_at(&self, lines: &[&str], start: usize) -> Option<(usize, Vec<StyledLine>)> {
+        let continues_quote = start > 0 && quote_text(lines[start - 1]).is_some();
+        if continues_quote || !lines[start].starts_with('>') {
+            return None;
+        }
+        let (kind, first_body) = AlertKind::parse_marker(quote_text(lines[start])?)?;
+
+        let mut body = Vec::new();
+        if !first_body.trim().is_empty() {
+            body.push(first_body.trim_start());
+        }
+        let mut end = start + 1;
+        while let Some(text) = lines.get(end).and_then(|line| quote_text(line)) {
+            body.push(text);
+            end += 1;
+        }
+
+        let bar = TextStyle::alert_bar(kind);
+        let mut title = StyledLine::styled(ALERT_BAR, bar);
+        title.push(kind.label(), TextStyle::alert_title(kind));
+        let mut output = vec![title];
+        let body_width = self.width.saturating_sub(display_width(ALERT_BAR));
+        for text in body {
+            for wrapped in wrap_lines(&[render_inline(text)], body_width) {
+                let mut row = StyledLine::styled(ALERT_BAR, bar);
+                row.spans.extend(wrapped.spans);
+                output.push(row);
+            }
+        }
+
+        Some((end, output))
     }
 
     fn highlight_code(&self, language: &str, body: &[&str]) -> Vec<StyledLine> {
@@ -346,9 +387,196 @@ fn is_rule(trimmed: &str) -> bool {
             || compact.chars().all(|ch| ch == '_'))
 }
 
+fn quote_text(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix('>')?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+const ALERT_BAR: &str = "┃ ";
+
+/// GitHub の alert (1 行目が `[!NOTE]` などの引用) の種類。
+#[derive(Clone, Copy)]
+pub(crate) enum AlertKind {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl AlertKind {
+    fn parse_marker(text: &str) -> Option<(Self, &str)> {
+        let (name, rest) = text.trim_start().strip_prefix("[!")?.split_once(']')?;
+        let kind = match name.to_ascii_uppercase().as_str() {
+            "NOTE" => Self::Note,
+            "TIP" => Self::Tip,
+            "IMPORTANT" => Self::Important,
+            "WARNING" => Self::Warning,
+            "CAUTION" => Self::Caution,
+            _ => return None,
+        };
+        Some((kind, rest))
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::Tip => "Tip",
+            Self::Important => "Important",
+            Self::Warning => "Warning",
+            Self::Caution => "Caution",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crossterm::style::Color;
+
     use super::*;
+
+    fn rgb(r: u8, g: u8, b: u8) -> Option<Color> {
+        Some(Color::Rgb { r, g, b })
+    }
+
+    fn row_bar_color(line: &StyledLine) -> Option<Color> {
+        line.spans.first().and_then(|span| span.style.fg)
+    }
+
+    fn assert_renders_as_plain_quote(source: &str) {
+        let lines = render_markdown(source, 40).lines;
+
+        assert_eq!(lines.len(), source.lines().count());
+        for (line, source_line) in lines.iter().zip(source.lines()) {
+            assert_eq!(line.plain_text(), source_line);
+            assert_eq!(line.spans[0].text, ">");
+            assert_eq!(line.spans[0].style, TextStyle::marker());
+        }
+    }
+
+    #[test]
+    fn alert_draws_every_row_in_its_level_color() {
+        let levels = [
+            ("NOTE", rgb(0x89, 0xB4, 0xFA)),
+            ("TIP", rgb(0xA6, 0xE3, 0xA1)),
+            ("IMPORTANT", rgb(0xCB, 0xA6, 0xF7)),
+            ("WARNING", rgb(0xF9, 0xE2, 0xAF)),
+            ("CAUTION", rgb(0xF3, 0x8B, 0xA8)),
+        ];
+
+        for (marker, color) in levels {
+            let lines = render_markdown(&format!("> [!{marker}]\n> body"), 40).lines;
+
+            assert_eq!(lines.len(), 2, "{marker}");
+            for line in &lines {
+                assert_eq!(row_bar_color(line), color, "{marker}");
+            }
+        }
+    }
+
+    #[test]
+    fn alert_title_row_is_bold_in_its_level_color() {
+        let lines = render_markdown("> [!WARNING]\n> body", 40).lines;
+        let yellow = rgb(0xF9, 0xE2, 0xAF);
+
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.style.bold && span.style.fg == yellow)
+        );
+        assert!(!lines[1].spans.iter().any(|span| span.style.bold));
+    }
+
+    #[test]
+    fn alert_bar_continues_on_wrapped_rows() {
+        let lines = render_markdown("> [!NOTE]\n> abcdefghijklmnopqrst", 12).lines;
+        let blue = rgb(0x89, 0xB4, 0xFA);
+
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert_eq!(row_bar_color(line), blue);
+            assert!(display_width(&line.plain_text()) <= 12);
+        }
+    }
+
+    #[test]
+    fn alert_marker_inside_a_quote_stays_a_plain_quote() {
+        assert_renders_as_plain_quote("> text\n> [!NOTE]\n> more");
+    }
+
+    #[test]
+    fn alert_marker_is_case_insensitive() {
+        let yellow = rgb(0xF9, 0xE2, 0xAF);
+
+        for marker in ["[!warning]", "[!Warning]"] {
+            let lines = render_markdown(&format!("> {marker}\n> body"), 40).lines;
+
+            assert!(
+                lines.iter().all(|line| row_bar_color(line) == yellow),
+                "{marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn indented_alert_marker_stays_a_plain_quote() {
+        let source = "- item\n  > [!NOTE]\n  > text";
+        let lines = render_markdown(source, 40).lines;
+
+        let texts: Vec<String> = lines.iter().map(StyledLine::plain_text).collect();
+        assert_eq!(texts, source.lines().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unknown_alert_marker_stays_a_plain_quote() {
+        assert_renders_as_plain_quote("> [!UNKNOWN]\n> text");
+    }
+
+    #[test]
+    fn alert_consumes_its_marker_and_keeps_the_text_after_it() {
+        let texts = render_markdown("> [!NOTE] first\n> second", 40)
+            .lines
+            .into_iter()
+            .map(|line| line.plain_text())
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts.len(), 3);
+        assert!(!texts.iter().any(|text| text.contains("[!")));
+        assert!(texts[1].ends_with("first"));
+        assert!(texts[2].ends_with("second"));
+    }
+
+    #[test]
+    fn blank_quote_row_inside_alert_keeps_the_bar() {
+        let lines = render_markdown("> [!TIP]\n> a\n>\n> b", 40).lines;
+        let green = rgb(0xA6, 0xE3, 0xA1);
+
+        assert_eq!(lines.len(), 4);
+        assert!(lines.iter().all(|line| row_bar_color(line) == green));
+    }
+
+    #[test]
+    fn alert_ends_at_the_first_line_outside_the_quote() {
+        let lines = render_markdown("> [!NOTE]\n> a\n\nafter", 40).lines;
+
+        assert_eq!(row_bar_color(&lines[1]), rgb(0x89, 0xB4, 0xFA));
+        assert!(lines[2].spans.is_empty());
+        assert_eq!(lines[3].plain_text(), "after");
+        assert_eq!(row_bar_color(&lines[3]), None);
+    }
+
+    #[test]
+    fn alert_body_keeps_inline_styles() {
+        let lines = render_markdown("> [!NOTE]\n> run `deploy.sh` now", 40).lines;
+
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.text == "deploy.sh" && span.style == TextStyle::code())
+        );
+    }
 
     #[test]
     fn renders_table_as_box() {

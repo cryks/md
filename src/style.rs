@@ -1,6 +1,8 @@
 use crossterm::style::{Attribute, Color};
 use unicode_width::UnicodeWidthChar;
 
+use crate::renderer::AlertKind;
+
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::Rgb { r, g, b }
 }
@@ -11,19 +13,23 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
 //
 // pub なものは chrome (ステータス行・ヘルプパネル) が状態に応じて色を
 // 選ぶために使う。本文側は下の TextStyle コンストラクタ経由で参照する。
-pub(crate) const GOLD: Color = rgb(0xFF, 0xC6, 0x6D); // 見出し (h1-h3)・強調
-const LAVENDER: Color = rgb(0xB4, 0xBE, 0xFE); // リストマーカー
-const TEAL: Color = rgb(0x94, 0xE2, 0xD5); // 引用・図の棒
-pub(crate) const GREEN: Color = rgb(0xA6, 0xE3, 0xA1); // コード
-const BLUE: Color = rgb(0x89, 0xB4, 0xFA); // リンク・図の線
-pub(crate) const MAUVE: Color = rgb(0xCB, 0xA6, 0xF7); // テーブルヘッダ
-pub(crate) const ROSE: Color = rgb(0xF3, 0x8B, 0xA8); // エラー
+pub(crate) const GOLD: Color = rgb(0xFF, 0xC6, 0x6D); // 見出し (h1-h3)・強調・図の箱
+const LAVENDER: Color = rgb(0xB4, 0xBE, 0xFE); // リストマーカー・図の箱
+const TEAL: Color = rgb(0x94, 0xE2, 0xD5); // 引用・図の棒と箱
+pub(crate) const GREEN: Color = rgb(0xA6, 0xE3, 0xA1); // コード・図の箱・TIP の alert
+const BLUE: Color = rgb(0x89, 0xB4, 0xFA); // リンク・図の線・NOTE の alert
+pub(crate) const MAUVE: Color = rgb(0xCB, 0xA6, 0xF7); // テーブルヘッダ・図の矢じり・IMPORTANT の alert
+pub(crate) const ROSE: Color = rgb(0xF3, 0x8B, 0xA8); // エラー・図の箱・CAUTION の alert
+const PINK: Color = rgb(0xF5, 0xC2, 0xE7); // 図の箱
+const SKY: Color = rgb(0x89, 0xDC, 0xEB); // 図の箱
 pub(crate) const GREY: Color = rgb(0x6C, 0x70, 0x86); // 記法マーカー・罫線
 const DARK_GREY: Color = rgb(0x58, 0x5B, 0x70); // テーブル罫線・図の棒の空き
 
 // 検索ハイライトの地色。本文の前景色に使っていない色相を選び、塗った範囲を
-// 本文のどの要素とも読み違えないようにする。
-const YELLOW: Color = rgb(0xF9, 0xE2, 0xAF); // 検索マッチ
+// 本文のどの要素とも読み違えないようにする。例外として YELLOW は警告の alert の
+// 棒と種類名にも使うが、前景色だけで地は塗らないので、面で塗った検索マッチとは
+// 形で見分けられる。
+const YELLOW: Color = rgb(0xF9, 0xE2, 0xAF); // 検索マッチ・WARNING の alert
 const PEACH: Color = rgb(0xFA, 0xB3, 0x87); // n/N でいま指しているマッチ
 const BASE: Color = rgb(0x1E, 0x1E, 0x2E); // 明るい地に載せる文字
 
@@ -127,6 +133,30 @@ impl TextStyle {
         }
     }
 
+    /// GitHub の alert の左端に引く棒。色相は GitHub の alert にそろえる。
+    /// 地は塗らない。diff 表示の `line_with_bg` は自前の地を持つ span の
+    /// 前景色を捨てるので、塗ると変更行で本文の色が消える。
+    pub(crate) fn alert_bar(kind: AlertKind) -> Self {
+        let color = match kind {
+            AlertKind::Note => BLUE,
+            AlertKind::Tip => GREEN,
+            AlertKind::Important => MAUVE,
+            AlertKind::Warning => YELLOW,
+            AlertKind::Caution => ROSE,
+        };
+        Self {
+            fg: Some(color),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn alert_title(kind: AlertKind) -> Self {
+        Self {
+            bold: true,
+            ..Self::alert_bar(kind)
+        }
+    }
+
     pub(crate) fn diagram_line() -> Self {
         Self {
             fg: Some(BLUE),
@@ -144,6 +174,24 @@ impl TextStyle {
     pub(crate) fn diagram_bar_track() -> Self {
         Self {
             fg: Some(DARK_GREY),
+            ..Self::default()
+        }
+    }
+
+    /// 図の箱に `index` 番目に割り当てる色。色の数を超えたら先頭の色に戻る。
+    pub(crate) fn diagram_box(index: usize) -> Self {
+        // 本文の色も使い回すが、図の線 (BLUE) と矢じり (MAUVE) の色は除き、
+        // 続けて割り当たる箱どうしの色相が離れる順に並べる。
+        const COLORS: [Color; 7] = [GREEN, PINK, GOLD, SKY, ROSE, LAVENDER, TEAL];
+        Self {
+            fg: Some(COLORS[index % COLORS.len()]),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn diagram_arrow() -> Self {
+        Self {
+            fg: Some(MAUVE),
             ..Self::default()
         }
     }
