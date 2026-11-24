@@ -11,6 +11,7 @@ use std::{
     cmp::Ordering,
     fs,
     io::{self, Write},
+    panic,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -146,6 +147,13 @@ impl TerminalSession {
         // Shift (端末によっては Option) 併用で従来どおり使え、ホイールは
         // `App::handle_mouse` が本文スクロールとして受け直す。
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
+        // panic メッセージは代替画面に書かれ、Drop で画面を戻すと一緒に消える。
+        // 先に端末を戻してからメッセージを出させ、原因が画面に残るようにする。
+        let print_panic = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            restore_terminal(&mut io::stdout());
+            print_panic(info);
+        }));
         Ok(Self { stdout })
     }
 
@@ -156,15 +164,19 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = execute!(
-            self.stdout,
-            Show,
-            DisableMouseCapture,
-            LeaveAlternateScreen,
-            ResetColor
-        );
-        let _ = disable_raw_mode();
+        restore_terminal(&mut self.stdout);
     }
+}
+
+fn restore_terminal(stdout: &mut io::Stdout) {
+    let _ = execute!(
+        stdout,
+        Show,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        ResetColor
+    );
+    let _ = disable_raw_mode();
 }
 
 #[derive(Debug)]
