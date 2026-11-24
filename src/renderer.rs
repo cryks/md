@@ -146,7 +146,6 @@ impl MarkdownRenderer {
 
         let language = trimmed
             .trim_start_matches(fence)
-            .trim()
             .split_whitespace()
             .next()
             .unwrap_or("")
