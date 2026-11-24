@@ -3,6 +3,7 @@
 
 mod diff;
 mod inline;
+mod mermaid;
 mod pager;
 mod renderer;
 mod style;

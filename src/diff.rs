@@ -302,9 +302,13 @@ fn word_class(grapheme: &str) -> Option<WordClass> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style::TextStyle;
 
     fn plain(lines: &[&str]) -> Vec<StyledLine> {
-        lines.iter().map(|line| StyledLine::plain(*line)).collect()
+        lines
+            .iter()
+            .map(|line| StyledLine::styled(*line, TextStyle::normal()))
+            .collect()
     }
 
     #[test]

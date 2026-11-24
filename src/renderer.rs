@@ -1,9 +1,9 @@
-use mermaid_text::RenderOptions;
 use pulldown_cmark::{Options, Parser};
 use syntect::{easy::HighlightLines, parsing::SyntaxSet};
 
 use crate::{
     inline::render_inline,
+    mermaid,
     style::{StyledLine, TextStyle, display_width, wrap_lines},
     table,
 };
@@ -168,7 +168,7 @@ impl MarkdownRenderer {
 
         if language.eq_ignore_ascii_case("mermaid") {
             let source = body.join("\n");
-            match self.render_mermaid(&source) {
+            match mermaid::render(&source, self.width) {
                 Ok(rendered_lines) => {
                     output.push(StyledLine::styled(*line, TextStyle::marker()));
                     output.extend(rendered_lines);
@@ -197,20 +197,6 @@ impl MarkdownRenderer {
         }
 
         Some((next, output))
-    }
-
-    fn render_mermaid(&self, source: &str) -> Result<Vec<StyledLine>, mermaid_text::Error> {
-        let rendered = mermaid_text::render_with_options(
-            source,
-            &RenderOptions {
-                max_width: Some(self.width),
-                ascii: false,
-                color: false,
-                ..RenderOptions::default()
-            },
-        )?;
-
-        Ok(rendered.lines().map(StyledLine::plain).collect())
     }
 
     fn highlight_code(&self, language: &str, body: &[&str]) -> Vec<StyledLine> {

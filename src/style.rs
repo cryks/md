@@ -13,13 +13,13 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
 // 選ぶために使う。本文側は下の TextStyle コンストラクタ経由で参照する。
 pub(crate) const GOLD: Color = rgb(0xFF, 0xC6, 0x6D); // 見出し (h1-h3)・強調
 const LAVENDER: Color = rgb(0xB4, 0xBE, 0xFE); // リストマーカー
-const TEAL: Color = rgb(0x94, 0xE2, 0xD5); // 引用
+const TEAL: Color = rgb(0x94, 0xE2, 0xD5); // 引用・図の棒
 pub(crate) const GREEN: Color = rgb(0xA6, 0xE3, 0xA1); // コード
-const BLUE: Color = rgb(0x89, 0xB4, 0xFA); // リンク
+const BLUE: Color = rgb(0x89, 0xB4, 0xFA); // リンク・図の線
 pub(crate) const MAUVE: Color = rgb(0xCB, 0xA6, 0xF7); // テーブルヘッダ
 pub(crate) const ROSE: Color = rgb(0xF3, 0x8B, 0xA8); // エラー
 pub(crate) const GREY: Color = rgb(0x6C, 0x70, 0x86); // 記法マーカー・罫線
-const DARK_GREY: Color = rgb(0x58, 0x5B, 0x70); // テーブル罫線
+const DARK_GREY: Color = rgb(0x58, 0x5B, 0x70); // テーブル罫線・図の棒の空き
 
 // 検索ハイライトの地色。本文の前景色に使っていない色相を選び、塗った範囲を
 // 本文のどの要素とも読み違えないようにする。
@@ -127,6 +127,37 @@ impl TextStyle {
         }
     }
 
+    pub(crate) fn diagram_line() -> Self {
+        Self {
+            fg: Some(BLUE),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn diagram_bar() -> Self {
+        Self {
+            fg: Some(TEAL),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn diagram_bar_track() -> Self {
+        Self {
+            fg: Some(DARK_GREY),
+            ..Self::default()
+        }
+    }
+
+    /// Mermaid の明るい fill に載せるラベル。書き手が文字色を指定していない
+    /// 場合に使う。
+    pub(crate) fn on_light_fill(fill: Color) -> Self {
+        Self {
+            fg: Some(BASE),
+            bg: Some(fill),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn error() -> Self {
         Self {
             fg: Some(ROSE),
@@ -221,12 +252,6 @@ pub(crate) struct StyledLine {
 impl StyledLine {
     pub(crate) fn empty() -> Self {
         Self { spans: Vec::new() }
-    }
-
-    pub(crate) fn plain(text: impl Into<String>) -> Self {
-        Self {
-            spans: vec![StyledSpan::new(text, TextStyle::normal())],
-        }
     }
 
     pub(crate) fn styled(text: impl Into<String>, style: TextStyle) -> Self {
@@ -349,16 +374,24 @@ pub(crate) fn line_with_search_highlight(
     line_with_style_overlay(line, &ranges, |_| style)
 }
 
-/// 全 span の背景を `bg` に置き換える。前景色と属性は保つ。
+/// 全 span の背景を `bg` に置き換える。前景色と属性は保つ。ただし自前の背景を
+/// 持つ span (Mermaid の fill) は、前景色がその背景に合わせて選ばれているので、
+/// 背景と一緒に捨てて既定色へ戻す。
 pub(crate) fn line_with_bg(line: &StyledLine, bg: Color) -> StyledLine {
     StyledLine {
         spans: line
             .spans
             .iter()
             .map(|span| {
+                let fg = if span.style.bg.is_some() {
+                    None
+                } else {
+                    span.style.fg
+                };
                 StyledSpan::new(
                     span.text.clone(),
                     TextStyle {
+                        fg,
                         bg: Some(bg),
                         ..span.style
                     },
@@ -456,7 +489,7 @@ mod tests {
 
     #[test]
     fn slices_line_by_display_columns() {
-        let line = StyledLine::plain("abcdef");
+        let line = StyledLine::styled("abcdef", TextStyle::normal());
 
         assert_eq!(slice_line(&line, 2, 3).plain_text(), "cde");
     }
@@ -473,6 +506,23 @@ mod tests {
         assert_eq!(output.spans[1].text, "world");
         assert_eq!(output.spans[1].style.bg, Some(Color::Red));
         assert_eq!(output.spans[1].style.fg, TextStyle::code().fg);
+    }
+
+    #[test]
+    fn line_bg_drops_a_foreground_picked_for_the_replaced_background() {
+        let line = StyledLine::styled(
+            "label",
+            TextStyle {
+                fg: Some(BASE),
+                bg: Some(YELLOW),
+                ..TextStyle::normal()
+            },
+        );
+
+        let output = line_with_bg(&line, Color::Blue);
+
+        assert_eq!(output.spans[0].style.bg, Some(Color::Blue));
+        assert_eq!(output.spans[0].style.fg, None);
     }
 
     #[test]

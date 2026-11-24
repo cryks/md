@@ -62,7 +62,7 @@ graph LR; A[Commit] --> B[Build] --> C[Test] --> D[Ship]
   lines are never wrapped — scroll horizontally instead.
 - **Mermaid without a browser** — ` ```mermaid ` blocks are rendered as
   Unicode diagrams via
-  [mermaid-text](https://crates.io/crates/mermaid-text).
+  [mermaid-text](https://crates.io/crates/mermaid-text), in color.
 - **A real pager** — less-style keys, case-insensitive search with match
   highlighting and a hit counter, horizontal scrolling. The status bar names
   only the state that differs from the default, and `?` shows the key list.
@@ -153,6 +153,22 @@ selection as you move so you can read a section before choosing it. From a
 heading in the body the list opens right there — under the line, or above it
 when the bottom of the screen is close — and the body holds still until you
 pick an entry.
+
+## Mermaid colors
+
+Diagrams are drawn in the palette of the page: box-drawing lines and arrowheads
+in blue, bars in teal over a dim track, and labels in the terminal's own text
+color.
+
+Flowcharts and state diagrams also take the colors written in the source:
+`fill`, `stroke` and `color` set through `style`, `classDef` and `linkStyle`.
+Pie slices cycle through twelve colors.
+
+Two adjustments keep source colors readable on a dark background. A light
+`fill` with no `color` gets a dark label. A `stroke` or `color` with less than
+about 2:1 contrast against the background is ignored in favor of the palette.
+This catches the `#333` common in examples written for a white page, and pure
+blue as well.
 
 ## Search
 
