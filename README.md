@@ -161,9 +161,11 @@ pick an entry.
 </p>
 
 `/` types a query into the status bar, which changes color while you edit it.
-Matching is case-insensitive and every match on screen is drawn in reverse,
-including matches inside the sticky headings. `n` and `N` walk the hits and the
-status bar keeps the count; a query that matches nothing says so instead.
+Matching is case-insensitive and every match on screen is filled in yellow,
+including matches inside the sticky headings. `n` and `N` walk the hits: each
+jump centers that line in the body, clear of the sticky band, and fills the hit
+you are on in orange. The status bar keeps the count; a query that matches
+nothing says so instead.
 
 ## Snapshot diff
 

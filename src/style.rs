@@ -21,6 +21,12 @@ pub(crate) const ROSE: Color = rgb(0xF3, 0x8B, 0xA8); // エラー
 pub(crate) const GREY: Color = rgb(0x6C, 0x70, 0x86); // 記法マーカー・罫線
 const DARK_GREY: Color = rgb(0x58, 0x5B, 0x70); // テーブル罫線
 
+// 検索ハイライトの地色。本文の前景色に使っていない色相を選び、塗った範囲を
+// 本文のどの要素とも読み違えないようにする。
+const YELLOW: Color = rgb(0xF9, 0xE2, 0xAF); // 検索マッチ
+const PEACH: Color = rgb(0xFA, 0xB3, 0x87); // n/N でいま指しているマッチ
+const BASE: Color = rgb(0x1E, 0x1E, 0x2E); // 明るい地に載せる文字
+
 pub(crate) const TEXT: Color = rgb(0xCD, 0xD6, 0xF4); // chrome の主テキスト
 pub(crate) const SUBTEXT: Color = rgb(0xA6, 0xAD, 0xC8); // chrome の副次テキスト
 
@@ -129,11 +135,24 @@ impl TextStyle {
         }
     }
 
+    /// 検索マッチ。地を明るく塗って本文から切り離す。前景を BASE に固定するの
+    /// は、元の span の色 (見出しの gold、コードの green) を残すと明るい地との
+    /// コントラストが足りず、塗った範囲ほど読みにくくなるため。
     pub(crate) fn search() -> Self {
         Self {
-            reverse: true,
+            fg: Some(BASE),
+            bg: Some(YELLOW),
             bold: true,
             ..Self::default()
+        }
+    }
+
+    /// `n`/`N` でいま指しているマッチ。他のマッチと同じ形のまま色相だけ変え、
+    /// 画面に複数のマッチが出ていてもどれを指しているかが分かるようにする。
+    pub(crate) fn search_current() -> Self {
+        Self {
+            bg: Some(PEACH),
+            ..Self::search()
         }
     }
 
@@ -307,14 +326,27 @@ pub(crate) fn display_width(text: &str) -> usize {
     text.chars().map(char_width).sum()
 }
 
-pub(crate) fn line_with_search_highlight(line: &StyledLine, query: &str) -> StyledLine {
+/// `query` に一致する範囲を塗り直した行を返す。`current` は、その行が `n`/`N`
+/// でいま指しているマッチかどうか。マッチ部分は元の span のスタイルを捨てるの
+/// で、地色を敷いた行 (sticky の帯、diff の変更行) に重ねてもマッチだけが
+/// ハイライトの色で残る。
+pub(crate) fn line_with_search_highlight(
+    line: &StyledLine,
+    query: &str,
+    current: bool,
+) -> StyledLine {
     if query.is_empty() {
         return line.clone();
     }
 
+    let style = if current {
+        TextStyle::search_current()
+    } else {
+        TextStyle::search()
+    };
     let plain = line.plain_text();
     let ranges = find_match_ranges(&plain, query);
-    line_with_style_overlay(line, &ranges, |_| TextStyle::search())
+    line_with_style_overlay(line, &ranges, |_| style)
 }
 
 /// 全 span の背景を `bg` に置き換える。前景色と属性は保つ。

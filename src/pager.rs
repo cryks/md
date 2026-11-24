@@ -293,6 +293,9 @@ struct FrameState {
     height: u16,
     diff_view: DiffView,
     query: String,
+    /// `n`/`N` が指していたマッチの行。変わると新旧 2 行の塗りが入れ替わる
+    /// ため、行の再利用はできない。
+    current_match: Option<usize>,
     sticky: Vec<usize>,
     /// sticky 領域が確保していた見出しスロット数。見出しの数が同じでも、
     /// diff の層の切り替えで空きスロットの数だけが変わることがある。
@@ -918,6 +921,7 @@ impl App {
             height: self.height,
             diff_view: self.diff_view,
             query: self.query.clone(),
+            current_match: self.current_match_line(),
             sticky,
             sticky_slots: slots,
             overlay: matches!(self.mode, Mode::Help | Mode::Section(_)),
@@ -931,8 +935,8 @@ impl App {
     /// 画面は動かないので、送るバイト数が全行描画に比べて桁で減る。
     ///
     /// 適用条件: Normal モードで、本文の描画内容を決める入力 (内容世代・
-    /// left・幅・高さ・diff 層・検索語・sticky チェーン) が前フレームと
-    /// 一致し、移動量が本文領域の高さ未満であること。ヘルプ表示中は
+    /// left・幅・高さ・diff 層・検索語・現在マッチ・sticky チェーン) が
+    /// 前フレームと一致し、移動量が本文領域の高さ未満であること。ヘルプ表示中は
     /// スクロールキー自体が届かない (最初の 1 打で閉じる) ので、パネルを
     /// 消し忘れる経路はない。
     fn scroll_frame(&self, frame: &mut Vec<u8>, sticky: &[usize], slots: usize) -> Result<bool> {
@@ -948,6 +952,7 @@ impl App {
             || last.height != self.height
             || last.diff_view != self.diff_view
             || last.query != self.query
+            || last.current_match != self.current_match_line()
             || last.sticky != sticky
             || last.sticky_slots != slots
         {
@@ -990,9 +995,12 @@ impl App {
         let width = self.width as usize;
         queue!(frame, MoveTo(0, row as u16))?;
 
+        let current_match = self.current_match_line() == Some(line_index);
+
         if let Some((rows, palette)) = self.active_layer() {
             if let Some(diff_row) = rows.get(line_index) {
-                let (composed, row_bg) = compose_diff_row(diff_row, palette, &self.query);
+                let (composed, row_bg) =
+                    compose_diff_row(diff_row, palette, &self.query, current_match);
                 let visible = slice_line(&composed, self.left, width);
                 draw_line(frame, &visible)?;
                 if let Some(bg) = row_bg {
@@ -1012,7 +1020,7 @@ impl App {
                 }
             }
         } else if let Some(line) = self.lines.get(line_index) {
-            let highlighted = line_with_search_highlight(line, &self.query);
+            let highlighted = line_with_search_highlight(line, &self.query, current_match);
             let visible = slice_line(&highlighted, self.left, width);
             draw_line(frame, &visible)?;
         }
@@ -1142,16 +1150,21 @@ impl App {
     }
 
     /// sticky に出す見出し 1 行。本文と同じ体裁のまま地色だけ差し替え、
-    /// 行末まで背景を敷いて帯として閉じる。
+    /// 行末まで背景を敷いて帯として閉じる。検索ハイライトは帯の地色を敷いた
+    /// 後に重ねるので、帯の中でもマッチはハイライトの色のまま残る。
     fn sticky_line(&self, line_index: usize) -> StyledLine {
         let width = self.width as usize;
         let source = match self.active_layer() {
             Some((rows, _)) => &rows[line_index].line,
             None => &self.lines[line_index],
         };
-        let highlighted = line_with_search_highlight(source, &self.query);
-        let visible = slice_line(&highlighted, self.left, width);
-        let mut composed = line_with_bg(&visible, style::STATUS_BG);
+        let tinted = line_with_bg(source, style::STATUS_BG);
+        let highlighted = line_with_search_highlight(
+            &tinted,
+            &self.query,
+            self.current_match_line() == Some(line_index),
+        );
+        let mut composed = slice_line(&highlighted, self.left, width);
         let pad = width.saturating_sub(display_width(&composed.plain_text()));
         composed.push(
             " ".repeat(pad),
@@ -1758,6 +1771,25 @@ impl App {
         self.match_index = None;
     }
 
+    /// `n`/`N` でいま指しているマッチの行 index。検索直後で位置がまだ決まって
+    /// いない間は None。
+    fn current_match_line(&self) -> Option<usize> {
+        self.match_index.map(|index| self.matches[index])
+    }
+
+    /// `line` が本文領域の中央に来るよう `top` を寄せる。sticky は本文の上端を
+    /// 覆うので、覆われる分を除いた残りの高さで中央を測る。段数は `top` で
+    /// 決まるため、行き先をいったん `top` に置いてから測る。文書の末尾側では
+    /// `max_top` で止まり、中央より下に出る。
+    fn center_on(&mut self, line: usize) {
+        self.top = line;
+        let hidden = self.sticky_height();
+        let visible = (self.body_height() as usize).saturating_sub(hidden).max(1);
+        self.top = line
+            .saturating_sub(hidden + visible / 2)
+            .min(self.max_top());
+    }
+
     fn jump_to_match_after_top(&mut self) {
         if self.matches.is_empty() {
             return;
@@ -1768,7 +1800,7 @@ impl App {
             .position(|line| *line >= self.top)
             .unwrap_or(0);
         self.match_index = Some(index);
-        self.top = self.matches[index].min(self.max_top());
+        self.center_on(self.matches[index]);
         self.left = 0;
     }
 
@@ -1781,7 +1813,7 @@ impl App {
             .map(|index| (index + 1) % self.matches.len())
             .unwrap_or(0);
         self.match_index = Some(next);
-        self.top = self.matches[next].min(self.max_top());
+        self.center_on(self.matches[next]);
         self.left = 0;
     }
 
@@ -1800,7 +1832,7 @@ impl App {
             })
             .unwrap_or_else(|| self.matches.len() - 1);
         self.match_index = Some(previous);
-        self.top = self.matches[previous].min(self.max_top());
+        self.center_on(self.matches[previous]);
         self.left = 0;
     }
 }
@@ -1921,14 +1953,18 @@ fn compose_diff_row(
     row: &DiffRow,
     palette: &DiffPalette,
     query: &str,
+    current_match: bool,
 ) -> (StyledLine, Option<Color>) {
     match &row.kind {
-        RowKind::Common => (line_with_search_highlight(&row.line, query), None),
+        RowKind::Common => (
+            line_with_search_highlight(&row.line, query, current_match),
+            None,
+        ),
         RowKind::Changed { emphasis } => {
             let tinted = line_with_bg(&row.line, palette.line_bg);
             let emphasized = line_with_bg_ranges(&tinted, emphasis, palette.emphasis_bg);
             (
-                line_with_search_highlight(&emphasized, query),
+                line_with_search_highlight(&emphasized, query, current_match),
                 Some(palette.line_bg),
             )
         }
@@ -2352,6 +2388,52 @@ mod tests {
         assert_eq!(app.matches.len(), 1);
     }
 
+    /// 検索でジャンプした行が sticky の帯に覆われず、上下に文脈が残る位置へ
+    /// 来ること。`top` をマッチ行そのものに合わせると、その行は帯の下敷きに
+    /// なって画面から消える。
+    #[test]
+    fn a_search_jump_centers_the_match_below_the_sticky_band() {
+        let mut source = String::from("# A\n\n");
+        for index in 0..40 {
+            match index {
+                20 => source.push_str("needle\n\n"),
+                _ => source.push_str(&format!("paragraph {index}\n\n")),
+            }
+        }
+        let mut app = app(&source, false);
+
+        app.query = "needle".to_owned();
+        app.rebuild_matches();
+        app.jump_to_match_after_top();
+
+        let row = app.current_match_line().unwrap() - app.top;
+        let sticky = app.sticky_height();
+        let visible = app.body_height() as usize - sticky;
+        assert!(sticky > 0, "sticky が出ない文書では覆いの検証にならない");
+        assert!(
+            row >= sticky,
+            "sticky に覆われている: row={row} sticky={sticky}"
+        );
+        assert!(
+            (row - sticky).abs_diff(visible / 2) <= 1,
+            "本文の中央から離れている: row={row} sticky={sticky} visible={visible}"
+        );
+    }
+
+    #[test]
+    fn sticky_keeps_the_search_highlight_over_the_band() {
+        let mut app = app("# needle\n\nbody\n", false);
+        app.query = "needle".to_owned();
+
+        let line = app.sticky_line(app.headings[0].line);
+
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.style.bg == TextStyle::search().bg)
+        );
+    }
+
     #[test]
     fn status_shows_snapshot_and_diff_state() {
         let mut app = app("content", false);
@@ -2513,6 +2595,33 @@ mod tests {
 
         let frame = app.render_frame().unwrap();
         assert!(!bytes_contain(&frame, b"\x1b[1S"));
+        assert!(bytes_contain(&frame, "━".as_bytes()));
+    }
+
+    /// `n` の移動量が画面高より小さくても、現在マッチの塗りが新旧 2 行で
+    /// 入れ替わるので、スクロールでの行の再利用はできない。フル再描画なら
+    /// sticky の h1 罫線 (━) を含む。
+    #[test]
+    fn moving_the_current_match_forces_a_full_repaint() {
+        let mut source = String::from("# A\n\n");
+        for index in 0..40 {
+            match index {
+                20 | 22 => source.push_str("needle\n\n"),
+                _ => source.push_str(&format!("paragraph {index}\n\n")),
+            }
+        }
+        let mut app = app(&source, false);
+        app.query = "needle".to_owned();
+        app.rebuild_matches();
+        app.jump_to_match_after_top();
+        let _ = app.render_frame().unwrap();
+
+        app.next_match();
+        let delta = app.top - app.last_frame.as_ref().unwrap().top;
+        assert!(delta > 0, "top が動かないと再利用経路を通らない");
+
+        let frame = app.render_frame().unwrap();
+        assert!(!bytes_contain(&frame, format!("\x1b[{delta}S").as_bytes()));
         assert!(bytes_contain(&frame, "━".as_bytes()));
     }
 
